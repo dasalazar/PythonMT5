@@ -42,24 +42,32 @@ Com $\alpha = \frac{2}{\text{PeriodoPuckAgressao} + 1}$:
 $$\text{MediaPos}[i] = \text{MediaPos}[i-1] + \alpha \times (\text{agress\_pos} - \text{MediaPos}[i-1])$$
 $$\text{MediaNeg}[i] = \text{MediaNeg}[i-1] + \alpha \times (\text{agress\_neg} - \text{MediaNeg}[i-1])$$
 
-### 3.4. Regras de Sinais e Coloração
-As linhas possuem regras independentes de inclinação:
+### 3.4. Definição de Onda (Cruzamento de Médias)
+- **Início de Nova Onda**: Ocorre no momento em que as médias `MediaPos` e `MediaNeg` se cruzam ($(\text{MediaPos}_i \ge \text{MediaNeg}_i) \neq (\text{MediaPos}_{i-1} \ge \text{MediaNeg}_{i-1})$).
+- Ao iniciar uma nova onda, o histórico de impulsos (flags de subida/queda) é **reinicializado**.
+
+### 3.5. Regras de Sinais e Coloração
+As linhas possuem regras independentes de inclinação e histórico de impulsos dentro da onda:
 - **Linha de Compra (`MediaPos`)**:
-  - `compra_subindo` ($\text{SinalC} = 1.0$): $\text{MediaPos}[i] \ge \min(\text{MediaPos}[i-1], \text{MediaPos}[i-2])$ $\rightarrow$ **Verde**.
-  - Caso contrário ($\text{SinalC} = 0.0$) $\rightarrow$ **Branco**.
+  - `compra_subindo`: $\text{MediaPos}[i] \ge \min(\text{MediaPos}[i-1], \text{MediaPos}[i-2])$
+    - Se é o **1º impulso de subida da onda** (ainda não houve queda após subir nesta onda) $\rightarrow$ **Verde Escuro** (`clrForestGreen`, $\text{SinalC} = 1.0$).
+    - Se está subindo **após já ter caído nesta mesma onda** (repique / 2º impulso) $\rightarrow$ **Verde Fraco** (`clrPaleGreen`, $\text{SinalC} = 2.0$).
+  - `compra_caindo`: $\text{MediaPos}[i] < \min(\text{MediaPos}[i-1], \text{MediaPos}[i-2])$ $\rightarrow$ **Branco** (`clrWhite`, $\text{SinalC} = 0.0$).
 - **Linha de Venda (`MediaNeg`)**:
-  - `venda_subindo` ($\text{SinalV} = 1.0$): $\text{MediaNeg}[i] \ge \min(\text{MediaNeg}[i-1], \text{MediaNeg}[i-2])$ $\rightarrow$ **Vermelho**.
-  - Caso contrário ($\text{SinalV} = 0.0$) $\rightarrow$ **Branco**.
+  - `venda_subindo`: $\text{MediaNeg}[i] \ge \min(\text{MediaNeg}[i-1], \text{MediaNeg}[i-2])$
+    - Se é o **1º impulso de subida da onda** $\rightarrow$ **Vermelho** (`clrRed`, $\text{SinalV} = 1.0$).
+    - Se está subindo **após já ter caído nesta mesma onda** (repique / 2º impulso) $\rightarrow$ **Rosa Fraco** (`clrLightPink`, $\text{SinalV} = 2.0$).
+  - `venda_caindo`: $\text{MediaNeg}[i] < \min(\text{MediaNeg}[i-1], \text{MediaNeg}[i-2])$ $\rightarrow$ **Branco** (`clrWhite`, $\text{SinalV} = 0.0$).
 
 ---
 
 ## 4. Mapeamento de Buffers (para uso via `iCustom`)
 
-| Buffer Index | Nome Interno | Tipo | Descrição |
+| Buffer Index | Nome Interno | Tipo | Descrição / Valores |
 | :---: | :--- | :--- | :--- |
 | `0` | `MediaPosBuffer` | `INDICATOR_DATA` | Valor numérico da EMA de Agressão Compradora. |
-| `1` | `CorPosBuffer` | `INDICATOR_COLOR_INDEX` | Índice de cor da linha compradora (0=Verde, 1=Branco). |
+| `1` | `CorPosBuffer` | `INDICATOR_COLOR_INDEX` | Índice de cor da linha compradora (`0` = Verde Escuro, `1` = Branco, `2` = Verde Fraco). |
 | `2` | `MediaNegBuffer` | `INDICATOR_DATA` | Valor numérico da EMA de Agressão Vendedora. |
-| `3` | `CorNegBuffer` | `INDICATOR_COLOR_INDEX` | Índice de cor da linha vendedora (0=Vermelho, 1=Branco). |
-| `4` | `SinalC` | `INDICATOR_CALCULATIONS` | `1.0` se Compra Subindo, `0.0` se Compra Caindo. |
-| `5` | `SinalV` | `INDICATOR_CALCULATIONS` | `1.0` se Venda Subindo, `0.0` se Venda Caindo. |
+| `3` | `CorNegBuffer` | `INDICATOR_COLOR_INDEX` | Índice de cor da linha vendedora (`0` = Vermelho, `1` = Branco, `2` = Rosa Fraco). |
+| `4` | `SinalC` | `INDICATOR_CALCULATIONS` | `1.0` = Compra 1º Impulso (Verde Escuro), `2.0` = Compra Repique (Verde Fraco), `0.0` = Compra Caindo (Branco). |
+| `5` | `SinalV` | `INDICATOR_CALCULATIONS` | `1.0` = Venda 1º Impulso (Vermelho), `2.0` = Venda Repique (Rosa Fraco), `0.0` = Venda Caindo (Branco). |

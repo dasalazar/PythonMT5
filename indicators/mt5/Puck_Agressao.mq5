@@ -16,14 +16,16 @@
 //| os dois flags ligados ("negócio direto") têm o volume dividido   |
 //| meio a meio entre compra e venda.                                |
 //|                                                                    |
-//| NOTA: o bloco original em NTSL tinha uma condição "else if"      |
-//| inalcançável (o cmfReal>0 dentro do else de cmfReal>0). O efeito |
-//| líquido do código original é matematicamente idêntico a:         |
-//|   agress_pos := max(cmfReal, 0)                                  |
-//|   agress_neg := max(-cmfReal, 0)                                 |
-//| que é o que está implementado abaixo. Se a intenção original era |
-//| outra (reação diferente quando o preço reverte contra o sinal),  |
-//| me avise para eu ajustar.                                        |
+//| REGRA DE ONDAS E COLORAÇÃO:                                      |
+//|  - Início de nova onda: quando MediaPos e MediaNeg se cruzam.    |
+//|  - Compra (MediaPos):                                            |
+//|     * Verde Escuro (clrForestGreen): 1º impulso de subida.       |
+//|     * Branco (clrWhite): Compra caindo / sem inclinação positiva.|
+//|     * Verde Fraco (clrPaleGreen): Subindo após já ter caído.     |
+//|  - Venda (MediaNeg):                                             |
+//|     * Vermelho (clrRed): 1º impulso de subida.                   |
+//|     * Branco (clrWhite): Venda caindo / sem inclinação positiva. |
+//|     * Rosa Fraco (clrLightPink): Subindo após já ter caído.      |
 //+------------------------------------------------------------------+
 #property indicator_separate_window
 #property indicator_buffers 6
@@ -31,12 +33,12 @@
 
 #property indicator_label1  "Media Agressao Compradora"
 #property indicator_type1   DRAW_COLOR_LINE
-#property indicator_color1  clrLime,clrWhite
+#property indicator_color1  clrForestGreen,clrWhite,clrPaleGreen
 #property indicator_width1  1
 
 #property indicator_label2  "Media Agressao Vendedora"
 #property indicator_type2   DRAW_COLOR_LINE
-#property indicator_color2  clrRed,clrWhite
+#property indicator_color2  clrRed,clrWhite,clrLightPink
 #property indicator_width2  1
 
 input int  PeriodoPuckAgressao   = 21;    // Período da soma móvel e da média exponencial
@@ -44,14 +46,18 @@ input bool ReconstruirHistorico  = true;  // true = opção 2 (reconstrói hist�
 input int  DiasHistoricoTicks    = 1;     // Usado só se ReconstruirHistorico=true (só precisa cobrir ~PeriodoPuckAgressao barras)
 
 double MediaPosBuffer[];   // media_agress_pos
-double CorPosBuffer[];     // índice de cor da linha compradora (0=verde, 1=branco) — independente da linha de venda
+double CorPosBuffer[];     // índice de cor compradora: 0=Verde Escuro, 1=Branco, 2=Verde Fraco
 double MediaNegBuffer[];   // media_agress_neg
-double CorNegBuffer[];     // índice de cor da linha vendedora (0=vermelho, 1=branco) — independente da linha de compra
-double SinalC[];           // SinalPuckAgressaoC = compra_subindo (1.0/0.0), buffer de dados apenas — fonte da cor da linha compradora
-double SinalV[];           // SinalPuckAgressaoV = venda_subindo (1.0/0.0), buffer de dados apenas — fonte da cor da linha vendedora
+double CorNegBuffer[];     // índice de cor vendedora: 0=Vermelho, 1=Branco, 2=Rosa Fraco
+double SinalC[];           // SinalPuckAgressaoC: 1.0 (verde escuro), 2.0 (verde fraco), 0.0 (branco)
+double SinalV[];           // SinalPuckAgressaoV: 1.0 (vermelho), 2.0 (rosa fraco), 0.0 (branco)
 
 double AgressionVolBuy[];  // arrays de trabalho (não são buffers de indicador)
 double AgressionVolSell[];
+bool   CompraJaSubiu[];    // rastreamento de estado por barra dentro da onda
+bool   CompraTeveQueda[];
+bool   VendaJaSubiu[];
+bool   VendaTeveQueda[];
 
 datetime g_ultimoTickProcessado = 0;
 bool     g_historicoCarregado   = false;
@@ -62,15 +68,26 @@ int OnInit()
    SetIndexBuffer(1, CorPosBuffer,   INDICATOR_COLOR_INDEX);
    SetIndexBuffer(2, MediaNegBuffer, INDICATOR_DATA);
    SetIndexBuffer(3, CorNegBuffer,   INDICATOR_COLOR_INDEX);
-   SetIndexBuffer(4, SinalC, INDICATOR_CALCULATIONS);
-   SetIndexBuffer(5, SinalV, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(4, SinalC,         INDICATOR_CALCULATIONS);
+   SetIndexBuffer(5, SinalV,         INDICATOR_CALCULATIONS);
 
    ArraySetAsSeries(MediaPosBuffer, false);
    ArraySetAsSeries(CorPosBuffer,   false);
    ArraySetAsSeries(MediaNegBuffer, false);
    ArraySetAsSeries(CorNegBuffer,   false);
-   ArraySetAsSeries(SinalC, false);
-   ArraySetAsSeries(SinalV, false);
+   ArraySetAsSeries(SinalC,         false);
+   ArraySetAsSeries(SinalV,         false);
+
+   // Força explicitamente a tabela de cores no terminal para evitar que o MT5 use cache anterior
+   PlotIndexSetInteger(0, PLOT_COLOR_INDEXES, 3);
+   PlotIndexSetInteger(0, PLOT_LINE_COLOR, 0, clrForestGreen); // 0 = Verde Escuro
+   PlotIndexSetInteger(0, PLOT_LINE_COLOR, 1, clrWhite);       // 1 = Branco
+   PlotIndexSetInteger(0, PLOT_LINE_COLOR, 2, clrPaleGreen);   // 2 = Verde Fraco
+
+   PlotIndexSetInteger(1, PLOT_COLOR_INDEXES, 3);
+   PlotIndexSetInteger(1, PLOT_LINE_COLOR, 0, clrRed);         // 0 = Vermelho
+   PlotIndexSetInteger(1, PLOT_LINE_COLOR, 1, clrWhite);       // 1 = Branco
+   PlotIndexSetInteger(1, PLOT_LINE_COLOR, 2, clrLightPink);   // 2 = Rosa Fraco
 
    IndicatorSetString(INDICATOR_SHORTNAME, "PuckAgressao(" + IntegerToString(PeriodoPuckAgressao) + ")");
    return(INIT_SUCCEEDED);
@@ -132,6 +149,10 @@ int OnCalculate(const int rates_total,
    {
       ArrayResize(AgressionVolBuy, rates_total);
       ArrayResize(AgressionVolSell, rates_total);
+      ArrayResize(CompraJaSubiu, rates_total);
+      ArrayResize(CompraTeveQueda, rates_total);
+      ArrayResize(VendaJaSubiu, rates_total);
+      ArrayResize(VendaTeveQueda, rates_total);
    }
 
    // --- Inicialização (uma única vez): reconstrói histórico ou não, conforme o parâmetro ---
@@ -139,6 +160,10 @@ int OnCalculate(const int rates_total,
    {
       ArrayInitialize(AgressionVolBuy, 0.0);
       ArrayInitialize(AgressionVolSell, 0.0);
+      ArrayInitialize(CompraJaSubiu, false);
+      ArrayInitialize(CompraTeveQueda, false);
+      ArrayInitialize(VendaJaSubiu, false);
+      ArrayInitialize(VendaTeveQueda, false);
 
       if(ReconstruirHistorico)
       {
@@ -190,6 +215,23 @@ int OnCalculate(const int rates_total,
    int start = (prev_calculated == 0) ? PeriodoPuckAgressao - 1 : MathMax(prev_calculated - 1, PeriodoPuckAgressao - 1);
    double alpha = 2.0 / (PeriodoPuckAgressao + 1.0);
 
+   if(prev_calculated == 0)
+   {
+      for(int k = 0; k < PeriodoPuckAgressao - 1; k++)
+      {
+         MediaPosBuffer[k] = 0.0;
+         MediaNegBuffer[k] = 0.0;
+         CorPosBuffer[k]   = 1; // branco
+         CorNegBuffer[k]   = 1; // branco
+         SinalC[k]         = 0.0;
+         SinalV[k]         = 0.0;
+         CompraJaSubiu[k]   = false;
+         CompraTeveQueda[k] = false;
+         VendaJaSubiu[k]    = false;
+         VendaTeveQueda[k]  = false;
+      }
+   }
+
    for(int i = start; i < rates_total; i++)
    {
       double somaDelta = 0.0, somaVolume = 0.0;
@@ -207,7 +249,7 @@ int OnCalculate(const int rates_total,
       double agress_pos = (cmfReal > 0) ? MathAbs(cmfReal) : 0.0;
       double agress_neg = (cmfReal < 0) ? MathAbs(cmfReal) : 0.0;
 
-      if(i == 0 || (i == start && prev_calculated == 0))
+      if(i == 0 || (i == PeriodoPuckAgressao - 1 && prev_calculated == 0))
       {
          // semente da média exponencial: primeiro valor calculado da janela
          MediaPosBuffer[i] = agress_pos;
@@ -219,29 +261,102 @@ int OnCalculate(const int rates_total,
          MediaNegBuffer[i] = MediaNegBuffer[i - 1] + alpha * (agress_neg - MediaNegBuffer[i - 1]);
       }
 
-      // --- Cor das linhas: cada linha agora tem sua PRÓPRIA regra,
-      //     independente da outra (compra e venda não se comparam entre si).
-      //     SinalC/SinalV são a fonte única de verdade — calculados aqui,
-      //     e a cor é derivada deles (não recalculada em separado). ---
+      // --- Início de nova onda: cruzamento das médias MediaPos e MediaNeg ---
+      bool cruzamento = false;
+      if(i > PeriodoPuckAgressao - 1)
+      {
+         bool posAcimaAtual = (MediaPosBuffer[i] >= MediaNegBuffer[i]);
+         bool posAcimaAnt   = (MediaPosBuffer[i - 1] >= MediaNegBuffer[i - 1]);
+         cruzamento = (posAcimaAtual != posAcimaAnt);
+      }
+
+      bool compra_ja_subiu   = false;
+      bool compra_teve_queda = false;
+      bool venda_ja_subiu    = false;
+      bool venda_teve_queda  = false;
+
+      if(i > 0 && !cruzamento)
+      {
+         // Herda estado da barra anterior dentro da mesma onda
+         compra_ja_subiu   = CompraJaSubiu[i - 1];
+         compra_teve_queda = CompraTeveQueda[i - 1];
+         venda_ja_subiu    = VendaJaSubiu[i - 1];
+         venda_teve_queda  = VendaTeveQueda[i - 1];
+      }
+      // Se cruzamento == true, as flags iniciam zeradas (false) para a nova onda
+
+      // --- Inclinação das médias ---
+      bool compra_subindo = false;
+      bool venda_subindo  = false;
+
       if(i >= 2)
       {
-         bool compra_subindo = (MediaPosBuffer[i] >= MathMin(MediaPosBuffer[i-1], MediaPosBuffer[i-2]));
-         bool venda_subindo  = (MediaNegBuffer[i] >= MathMin(MediaNegBuffer[i-1], MediaNegBuffer[i-2]));
+         compra_subindo = (MediaPosBuffer[i] >= MathMin(MediaPosBuffer[i - 1], MediaPosBuffer[i - 2]));
+         venda_subindo  = (MediaNegBuffer[i] >= MathMin(MediaNegBuffer[i - 1], MediaNegBuffer[i - 2]));
+      }
+      else if(i == 1)
+      {
+         compra_subindo = (MediaPosBuffer[i] >= MediaPosBuffer[i - 1]);
+         venda_subindo  = (MediaNegBuffer[i] >= MediaNegBuffer[i - 1]);
+      }
 
-         SinalC[i] = compra_subindo ? 1.0 : 0.0;
-         SinalV[i] = venda_subindo  ? 1.0 : 0.0;
+      // --- Classificação de Sinal e Cor para Compra (MediaPos) ---
+      if(compra_subindo)
+      {
+         if(!compra_teve_queda)
+         {
+            // 1º impulso de subida da onda -> Verde Escuro
+            SinalC[i]       = 1.0;
+            CorPosBuffer[i] = 0; // 0 = clrForestGreen
+            compra_ja_subiu = true;
+         }
+         else
+         {
+            // Repique: subindo após já ter caído nesta mesma onda -> Verde Fraco
+            SinalC[i]       = 2.0;
+            CorPosBuffer[i] = 2; // 2 = clrPaleGreen
+         }
       }
       else
       {
-         SinalC[i] = 0.0; // sem barras suficientes ainda: assume caindo por padrão
-         SinalV[i] = 0.0;
+         // Compra caindo / sem inclinação positiva -> Branco
+         SinalC[i]       = 0.0;
+         CorPosBuffer[i] = 1; // 1 = clrWhite
+         if(compra_ja_subiu)
+            compra_teve_queda = true;
       }
 
-      int corPos = (SinalC[i] == 1.0) ? 0 : 1; // 0 = verde, 1 = branco
-      int corNeg = (SinalV[i] == 1.0) ? 0 : 1; // 0 = vermelho, 1 = branco
+      // --- Classificação de Sinal e Cor para Venda (MediaNeg) ---
+      if(venda_subindo)
+      {
+         if(!venda_teve_queda)
+         {
+            // 1º impulso de subida da onda -> Vermelho
+            SinalV[i]       = 1.0;
+            CorNegBuffer[i] = 0; // 0 = clrRed
+            venda_ja_subiu  = true;
+         }
+         else
+         {
+            // Repique: subindo após já ter caído nesta mesma onda -> Rosa Fraco
+            SinalV[i]       = 2.0;
+            CorNegBuffer[i] = 2; // 2 = clrLightPink
+         }
+      }
+      else
+      {
+         // Venda caindo / sem inclinação positiva -> Branco
+         SinalV[i]       = 0.0;
+         CorNegBuffer[i] = 1; // 1 = clrWhite
+         if(venda_ja_subiu)
+            venda_teve_queda = true;
+      }
 
-      CorPosBuffer[i] = corPos;
-      CorNegBuffer[i] = corNeg;
+      // Salva os estados da barra para persistência incremental
+      CompraJaSubiu[i]   = compra_ja_subiu;
+      CompraTeveQueda[i] = compra_teve_queda;
+      VendaJaSubiu[i]    = venda_ja_subiu;
+      VendaTeveQueda[i]  = venda_teve_queda;
    }
 
    return(rates_total);
