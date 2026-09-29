@@ -798,9 +798,9 @@ void OnTick()
    if(CopyBuffer(handlePuck, 4, 0, 1, puckSinalCArr) <= 0) return;
    if(CopyBuffer(handlePuck, 5, 0, 1, puckSinalVArr) <= 0) return;
 
-   // TPV_SMA: buffer 1 = CorTPV (0=Verde / Comprado+Subindo, 1=Vermelho / Vendido+Caindo, 2=Branco)
-   double tpvCorArr[];
-   if(CopyBuffer(handleTPV, 1, 0, 1, tpvCorArr) <= 0) return;
+   // TPV_SMA: buffer 5 = TPVSubindo (1.0 = subindo, 0.0 = caindo)
+   double tpvSubindoArr[];
+   if(CopyBuffer(handleTPV, 5, 0, 1, tpvSubindoArr) <= 0) return;
 
    bool compra_verde_escuro = (puckSinalCArr[0] == 1.0); // Puck Comprador Verde Escuro (1º impulso)
    bool venda_vermelho      = (puckSinalVArr[0] == 1.0); // Puck Vendedor Vermelho (1º impulso)
@@ -808,19 +808,19 @@ void OnTick()
    bool venda_subindo       = (puckSinalVArr[0] > 0.0);  // Puck Vendedor ativo (Vermelho ou Rosa)
    bool compra_caindo       = (puckSinalCArr[0] == 0.0); // Puck Comprador Branco
    bool venda_caindo        = (puckSinalVArr[0] == 0.0); // Puck Vendedor Branco
-   bool TPV_verde           = (tpvCorArr[0] == 0.0);     // TPV Comprado + Subindo (Verde)
-   bool TPV_vermelho        = (tpvCorArr[0] == 1.0);     // TPV Vendido + Caindo (Vermelho)
+   bool TPV_subindo         = (tpvSubindoArr[0] == 1.0); // TPV subindo
+   bool TPV_caindo          = !TPV_subindo;              // TPV caindo
 
    // Entrada / Reentrada:
-   //  - Compra: Puck Verde Escuro (1º impulso) + TPV Verde
-   //  - Venda:  Puck Vermelho (1º impulso) + TPV Vermelho
-   bool sinalCompra = compra_verde_escuro && TPV_verde;
-   bool sinalVenda  = venda_vermelho && TPV_vermelho;
+   //  - Compra: Puck Verde Escuro (1º impulso) + TPV Subindo
+   //  - Venda:  Puck Vermelho (1º impulso) + TPV Caindo
+   bool sinalCompra = compra_verde_escuro && TPV_subindo;
+   bool sinalVenda  = venda_vermelho && TPV_caindo;
 
    // Mola (v3): Ativação e Desativação mutuamente exclusivas para evitar oscilação rápida (flapping)
-   bool molaAtivaCompra    = TPV_vermelho || (compra_caindo && venda_subindo);
+   bool molaAtivaCompra    = TPV_caindo  || (compra_caindo && venda_subindo);
    bool molaDesativaCompra = !molaAtivaCompra;
-   bool molaAtivaVenda     = TPV_verde    || (venda_caindo && compra_subindo);
+   bool molaAtivaVenda     = TPV_subindo || (venda_caindo && compra_subindo);
    bool molaDesativaVenda  = !molaAtivaVenda;
 
    if(!PositionSelect(_Symbol))
@@ -840,14 +840,14 @@ void OnTick()
 
       if(sinalCompra)
       {
-         Print("Sinal de entrada COMPRA (Puck Verde Escuro + TPV Verde): compra_verde_escuro=", compra_verde_escuro,
-               " TPV_verde=", TPV_verde);
+         Print("Sinal de entrada COMPRA (Puck Verde Escuro + TPV subindo): compra_verde_escuro=", compra_verde_escuro,
+               " TPV_subindo=", TPV_subindo);
          AbrirGrid(ORDER_TYPE_BUY);
       }
       else if(sinalVenda)
       {
-         Print("Sinal de entrada VENDA (Puck Vermelho + TPV Vermelho): venda_vermelho=", venda_vermelho,
-               " TPV_vermelho=", TPV_vermelho);
+         Print("Sinal de entrada VENDA (Puck Vermelho + TPV caindo): venda_vermelho=", venda_vermelho,
+               " TPV_caindo=", TPV_caindo);
          AbrirGrid(ORDER_TYPE_SELL);
       }
       // se nenhum dos dois lados bater todas as condições, não entra
@@ -873,12 +873,12 @@ void OnTick()
    {
       if(!g_molaAtiva && molaAtivaCompra)
       {
-         Print("Sinal de MOLA COMPRA (ativa): TPV_vermelho=", TPV_vermelho, " compra_caindo=", compra_caindo, " venda_subindo=", venda_subindo);
+         Print("Sinal de MOLA COMPRA (ativa): TPV_caindo=", TPV_caindo, " compra_caindo=", compra_caindo, " venda_subindo=", venda_subindo);
          AtivarMola();
       }
       else if(g_molaAtiva && molaDesativaCompra)
       {
-         Print("Sinal de MOLA COMPRA (desativa): TPV_verde=", TPV_verde, " compra_subindo=", compra_subindo, " venda_caindo=", venda_caindo);
+         Print("Sinal de MOLA COMPRA (desativa): TPV_subindo=", TPV_subindo, " compra_subindo=", compra_subindo, " venda_caindo=", venda_caindo);
          DesativarMolaSemFechar();
       }
    }
@@ -886,12 +886,12 @@ void OnTick()
    {
       if(!g_molaAtiva && molaAtivaVenda)
       {
-         Print("Sinal de MOLA VENDA (ativa): TPV_verde=", TPV_verde, " venda_caindo=", venda_caindo, " compra_subindo=", compra_subindo);
+         Print("Sinal de MOLA VENDA (ativa): TPV_subindo=", TPV_subindo, " venda_caindo=", venda_caindo, " compra_subindo=", compra_subindo);
          AtivarMola();
       }
       else if(g_molaAtiva && molaDesativaVenda)
       {
-         Print("Sinal de MOLA VENDA (desativa): TPV_vermelho=", TPV_vermelho, " venda_subindo=", venda_subindo, " compra_caindo=", compra_caindo);
+         Print("Sinal de MOLA VENDA (desativa): TPV_caindo=", TPV_caindo, " venda_subindo=", venda_subindo, " compra_caindo=", compra_caindo);
          DesativarMolaSemFechar();
       }
    }
