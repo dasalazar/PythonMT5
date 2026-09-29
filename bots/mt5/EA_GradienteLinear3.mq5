@@ -518,18 +518,12 @@ void AtivarMola()
 
    bool ehCompra = (direcao_atual == 1);
    ENUM_ORDER_TYPE tipoEntradaPendente = ehCompra ? ORDER_TYPE_BUY_LIMIT  : ORDER_TYPE_SELL_LIMIT;
-   ENUM_ORDER_TYPE tipoSaida           = ehCompra ? ORDER_TYPE_SELL_LIMIT : ORDER_TYPE_BUY_LIMIT;
 
-   // Cancela as OCOs individuais existentes (preservando o balde, se já
-   // existir) — depois disso, todo o volume da posição fica "descoberto",
-   // e o AtualizarBalde() logo abaixo recalcula o balde do zero, cobrindo
-   // automaticamente tudo que não tem mais OCO individual.
-   if(PositionSelect(_Symbol))
-      CancelarOrdensPorTipo(tipoSaida, g_baldeTicket);
-
+   // Mantém todas as ordens OCO individuais ativas no preço original (a menos que ultrapassem o teto).
+   // O AtualizarBalde() cuida de migrar apenas as ordens que ultrapassarem o teto e dimensionar o balde.
    AtualizarBalde();
 
-   // Aplica a progressão de lotes por nível nas pendentes de entrada que faltam a partir deste momento
+   // A Mola altera apenas a quantidade de contratos das ordens pendentes de entrada ainda não executadas
    CancelarOrdensPorTipo(tipoEntradaPendente);
    int niveisPreenchidosGrid = g_totalNiveis - 1; // exclui a entrada a mercado (nível 0)
    for(int nivel = niveisPreenchidosGrid + 1; nivel <= NiveisGradiente; nivel++)
@@ -542,7 +536,7 @@ void AtivarMola()
          Print("Mola: falha ao colocar nivel ", nivel, " com ", loteNivel, " contratos em ", DoubleToString(nivelPreco, _Digits), ": ", trade.ResultRetcodeDescription());
    }
 
-   Print("MOLA ATIVADA (", (ehCompra ? "compra" : "venda"), "). Pendentes ajustadas por nivel. Balde: volume=", g_baldeVolume);
+   Print("MOLA ATIVADA (", (ehCompra ? "compra" : "venda"), "). Pendentes de entrada ajustadas por nivel. Balde: volume=", g_baldeVolume);
 }
 
 //+------------------------------------------------------------------+

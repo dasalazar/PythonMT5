@@ -90,10 +90,12 @@ Executada apenas quando o robô **não possui posição** (`!PositionSelect`):
   - Compra: `TPV_caindo` ou (`compra_caindo && venda_subindo`).
   - Venda: `TPV_subindo` ou (`venda_caindo && compra_subindo`).
 - **Comportamento na Ativação**:
-  - Atualiza as entradas pendentes com a progressão da tabela.
-  - Cancela OCOs individuais fora do balde e recalcula o Balde consolidado no $\text{Preço Médio} \pm \text{MolaPontos}$.
-  - $\text{Volume Balde} = \text{Volume Total Posição} - \text{Volume OCOs Individuais Pendentes}$.
-- **Persistência**: Ao desativar a Mola, as entradas pendentes voltam a 1x, mas o Balde é preservado até o fim do ciclo.
+  - As ordens OCO individuais existentes são **mantidas ativas em seus preços originais** (desde que respeitem o teto do preço médio $\pm \text{MolaPontos}$).
+  - Apenas as ordens que ultrapassarem o preço teto são migradas para o balde.
+  - A única alteração que a Mola faz nas ordens pendentes é **ajustar a quantidade de contratos das ordens de entrada do grid ainda não executadas**, aplicando a tabela de progressão.
+  - O volume do Balde é sempre mantido na invariante:
+    $$\text{Volume Balde} = \text{Volume Total Posição} - \text{Volume OCOs Individuais Válidas}$$
+- **Desativação da Mola**: Ao desativar a Mola, apenas as ordens de entrada pendentes voltam para 1 contrato (`QuantidadePorOrdem`), mantendo todas as ordens OCO e o Balde intactos.
 
 ### 4.4. Teto Universal e Stop Financeiro Global
 - OCOs individuais nunca podem ultrapassar o preço do balde ($\text{Preço Médio} \pm \text{MolaPontos}$). Violações são migradas para o balde (`MigrarOrdensAlemDoTeto`).
