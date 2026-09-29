@@ -791,16 +791,17 @@ void OnTick()
    }
 
    // Puck_Agressao:
+   // Leitura na Barra 1 (barra anterior já fechada/consolidada, eliminando ruído e repintura intra-tick):
    //  SinalC (buffer 4): 1.0 = Verde Escuro (1º impulso), 2.0 = Verde Claro (repique), 0.0 = Branco (caindo)
    //  SinalV (buffer 5): 1.0 = Vermelho (1º impulso), 2.0 = Rosa Fraco (repique), 0.0 = Branco (caindo)
    double puckSinalCArr[], puckSinalVArr[];
 
-   if(CopyBuffer(handlePuck, 4, 0, 1, puckSinalCArr) <= 0) return;
-   if(CopyBuffer(handlePuck, 5, 0, 1, puckSinalVArr) <= 0) return;
+   if(CopyBuffer(handlePuck, 4, 1, 1, puckSinalCArr) <= 0) return;
+   if(CopyBuffer(handlePuck, 5, 1, 1, puckSinalVArr) <= 0) return;
 
-   // TPV_SMA: buffer 5 = TPVSubindo (1.0 = subindo, 0.0 = caindo)
+   // TPV_SMA: buffer 5 = TPVSubindo na barra fechada (1.0 = subindo, 0.0 = caindo)
    double tpvSubindoArr[];
-   if(CopyBuffer(handleTPV, 5, 0, 1, tpvSubindoArr) <= 0) return;
+   if(CopyBuffer(handleTPV, 5, 1, 1, tpvSubindoArr) <= 0) return;
 
    bool compra_verde_escuro = (puckSinalCArr[0] == 1.0); // Puck Comprador Verde Escuro (1º impulso)
    bool venda_vermelho      = (puckSinalVArr[0] == 1.0); // Puck Vendedor Vermelho (1º impulso)
