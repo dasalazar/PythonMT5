@@ -425,25 +425,34 @@ void TratarSaidaOCO(long tipoDealSaida, double precoSaida, double volumeSaida)
 //+------------------------------------------------------------------+
 void ColocarSaidaOCO(bool ehCompra, double precoEntradaNivel, double volume)
 {
-   double precoSaida;
-   bool   ok;
+   if(volume <= 0) return;
 
-   if(ehCompra)
+   double precoSaida = NormalizarPreco(ehCompra ? (precoEntradaNivel + DistanciaGridSaida) : (precoEntradaNivel - DistanciaGridSaida));
+
+   if(PositionSelect(_Symbol))
    {
-      precoSaida = NormalizarPreco(precoEntradaNivel + DistanciaGridSaida);
-      ok = trade.SellLimit(volume, precoSaida, _Symbol);
+      double precoMedio = PositionGetDouble(POSITION_PRICE_OPEN);
+      double teto       = ehCompra ? (precoMedio + MolaPontos) : (precoMedio - MolaPontos);
+      bool ultrapassa   = ehCompra ? (precoSaida > teto) : (precoSaida < teto);
+
+      if(ultrapassa)
+      {
+         Print("Saida individual em ", DoubleToString(precoSaida, _Digits),
+               " ultrapassa o teto (", DoubleToString(teto, _Digits), "). Volume ", volume, " vai direto para o balde.");
+         AtualizarBalde();
+         return;
+      }
    }
-   else
-   {
-      precoSaida = NormalizarPreco(precoEntradaNivel - DistanciaGridSaida);
-      ok = trade.BuyLimit(volume, precoSaida, _Symbol);
-   }
+
+   bool ok = ehCompra ? trade.SellLimit(volume, precoSaida, _Symbol) : trade.BuyLimit(volume, precoSaida, _Symbol);
 
    if(ok)
-      Print("Saida OCO colocada: nivel preenchido em ", DoubleToString(precoEntradaNivel, _Digits),
-            " -> alvo de saida em ", DoubleToString(precoSaida, _Digits));
+      Print("Saida OCO individual colocada: nivel ", DoubleToString(precoEntradaNivel, _Digits),
+            " -> alvo em ", DoubleToString(precoSaida, _Digits), " | vol=", volume);
    else
       Print("Falha ao colocar saida OCO em ", DoubleToString(precoSaida, _Digits), ": ", trade.ResultRetcodeDescription());
+
+   AtualizarBalde();
 }
 
 //+------------------------------------------------------------------+
@@ -573,29 +582,12 @@ void MigrarOrdensAlemDoTeto(ENUM_ORDER_TYPE tipo, double teto, bool ehCompra)
 //| Recria a ordem do balde no preço médio ATUAL da posição ±          |
 //| MolaPontos, com o volume recalculado DO ZERO a cada chamada:      |
 //| volume_balde = volume_da_posição - volume_ainda_coberto_por_OCOs_ |
-//| individuais_pendentes. Isso garante que o balde sempre reflita o  |
-//| volume real restante, mesmo que uma OCO individual tenha saído no |
-//| meio do caminho — não fica dependendo de um contador incrementado |
-//| aos poucos, que poderia dessincronizar.                           |
-//|                                                                    |
-//| Chamada em toda nova execução (entrada), aumento de posição, ou   |
-//| saída de ordem intermediária (OCO individual preenchendo) — pra   |
-//| que o preço médio + MolaPontos sempre cubra o fechamento de TODAS |
-//| as ordens ainda em aberto, sem risco de sobrar posição descoberta.|
-//|                                                                    |
-//| IMPORTANTE: cria a ordem NOVA primeiro, só cancela a ANTIGA depois|
-//| de confirmar que a nova foi aceita — nunca ao contrário. Cancelar |
-//| primeiro e a criação da nova falhar deixaria o volume do balde    |
-//| sem NENHUMA ordem cobrindo, sem proteção nenhuma (foi exatamente  |
-//| isso que causou o balde "sumir" num teste real). Tenta até 3      |
-//| vezes antes de desistir, e mantém a ordem antiga se todas falharem.|
+//| individuais_pendentes. Isso garante que a soma de todas as ordens |
+//| de saída seja SEMPRE IGUAL ao volume da posição, sem falta e      |
+//| sem excesso (evitando inversão indesejada de posição no Netting). |
 //+------------------------------------------------------------------+
 void AtualizarBalde()
 {
-   // O balde só existe durante ou após ativação da Mola
-   if(!g_baldeExiste && !g_molaAtiva)
-      return;
-
    if(!PositionSelect(_Symbol))
    {
       if(g_baldeTicket != 0)
@@ -620,11 +612,22 @@ void AtualizarBalde()
    double precoMedio = PositionGetDouble(POSITION_PRICE_OPEN);
    double teto       = ehCompra ? (precoMedio + MolaPontos) : (precoMedio - MolaPontos);
 
+   // 1. Sempre migra OCOs individuais que ultrapassam o teto (independente de Mola estar ligada ou não)
    MigrarOrdensAlemDoTeto(tipoSaida, teto, ehCompra);
 
    double volumePosicao    = PositionGetDouble(POSITION_VOLUME);
    double volumeIndividual = SomarVolumeIndividualPendente(tipoSaida);
-   double novoVolumeBalde  = volumePosicao - volumeIndividual;
+
+   // 2. Trava de segurança contra inversão: se volumeIndividual > volumePosicao, cancela excesso
+   if(volumeIndividual > volumePosicao)
+   {
+      Print("!!! ALERTA DE SEGURANÇA: Volume de saidas individuais (", volumeIndividual,
+            ") > volume da posicao (", volumePosicao, "). Cancelando ordens excedentes.");
+      CancelarOrdensPorTipo(tipoSaida, g_baldeTicket);
+      volumeIndividual = SomarVolumeIndividualPendente(tipoSaida);
+   }
+
+   double novoVolumeBalde = volumePosicao - volumeIndividual;
 
    if(novoVolumeBalde <= 0)
    {
@@ -902,9 +905,8 @@ void OnTick()
       }
    }
 
-   // Se o balde ou a Mola estiverem ativos, mantém o balde sincronizado
-   if(g_baldeExiste || g_molaAtiva)
-      AtualizarBalde();
+   // Mantém auditoria contínua de cobertura e migração de teto para 100% da posição aberta
+   AtualizarBalde();
 }
 
 //+------------------------------------------------------------------+
