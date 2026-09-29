@@ -792,8 +792,8 @@ void OnTick()
 
    // Puck_Agressao:
    // Leitura na Barra 1 (barra anterior já fechada/consolidada, eliminando ruído e repintura intra-tick):
-   //  SinalC (buffer 4): 1.0 = Verde Escuro (1º impulso), 2.0 = Verde Claro (repique), 0.0 = Branco (caindo)
-   //  SinalV (buffer 5): 1.0 = Vermelho (1º impulso), 2.0 = Rosa Fraco (repique), 0.0 = Branco (caindo)
+   //  SinalC (buffer 4): 1.0 = Verde Escuro, 2.0 = Verde Claro, 0.0 = Branco
+   //  SinalV (buffer 5): 1.0 = Vermelho, 2.0 = Rosa Fraco, 0.0 = Branco
    double puckSinalCArr[], puckSinalVArr[];
 
    if(CopyBuffer(handlePuck, 4, 1, 1, puckSinalCArr) <= 0) return;
@@ -803,18 +803,18 @@ void OnTick()
    double tpvSubindoArr[];
    if(CopyBuffer(handleTPV, 5, 1, 1, tpvSubindoArr) <= 0) return;
 
-   bool compra_verde_escuro = (puckSinalCArr[0] == 1.0); // Puck Comprador Verde Escuro (1º impulso)
-   bool venda_vermelho      = (puckSinalVArr[0] == 1.0); // Puck Vendedor Vermelho (1º impulso)
-   bool compra_subindo      = (puckSinalCArr[0] > 0.0);  // Puck Comprador ativo (Verde Escuro ou Claro)
-   bool venda_subindo       = (puckSinalVArr[0] > 0.0);  // Puck Vendedor ativo (Vermelho ou Rosa)
+   bool compra_verde_escuro = (puckSinalCArr[0] == 1.0); // Puck Comprador Verde Escuro (cor do Puck)
+   bool venda_vermelho      = (puckSinalVArr[0] == 1.0); // Puck Vendedor Vermelho (cor do Puck)
+   bool compra_subindo      = (puckSinalCArr[0] > 0.0);  // Puck Comprador colorido (Verde Escuro ou Claro)
+   bool venda_subindo       = (puckSinalVArr[0] > 0.0);  // Puck Vendedor colorido (Vermelho ou Rosa)
    bool compra_caindo       = (puckSinalCArr[0] == 0.0); // Puck Comprador Branco
    bool venda_caindo        = (puckSinalVArr[0] == 0.0); // Puck Vendedor Branco
    bool TPV_subindo         = (tpvSubindoArr[0] == 1.0); // TPV subindo
    bool TPV_caindo          = !TPV_subindo;              // TPV caindo
 
    // Entrada / Reentrada:
-   //  - Compra: Puck Verde Escuro (1º impulso) + TPV Subindo
-   //  - Venda:  Puck Vermelho (1º impulso) + TPV Caindo
+   //  - Compra: Puck Verde Escuro + TPV Subindo
+   //  - Venda:  Puck Vermelho + TPV Caindo
    bool sinalCompra = compra_verde_escuro && TPV_subindo;
    bool sinalVenda  = venda_vermelho && TPV_caindo;
 
@@ -838,6 +838,18 @@ void OnTick()
 
       direcao_atual    = 0;
       niveis_colocados = 0;
+
+      // Diagnóstico: uma linha por barra nova enquanto zerado, com os valores brutos lidos (barra 1).
+      static datetime ultimaBarraDiag = 0;
+      datetime barraAtual = iTime(_Symbol, PERIOD_CURRENT, 0);
+      if(barraAtual != ultimaBarraDiag)
+      {
+         ultimaBarraDiag = barraAtual;
+         Print("Zerado - leitura barra 1: SinalC=", DoubleToString(puckSinalCArr[0], 1),
+               " SinalV=", DoubleToString(puckSinalVArr[0], 1),
+               " TPVSubindo=", DoubleToString(tpvSubindoArr[0], 1),
+               " | sinalCompra=", sinalCompra, " sinalVenda=", sinalVenda);
+      }
 
       if(sinalCompra)
       {
