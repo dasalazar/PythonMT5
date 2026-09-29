@@ -103,18 +103,19 @@ double NormalizarPreco(double preco)
 input int    NiveisGradiente     = 50;      // Níveis máximos do grid
 input double DistanciaGrid       = 75.0;    // Distância entre níveis de ENTRADA (pontos de preço)
 input double DistanciaGridSaida  = 100.0;   // Distância da saída OCO individual, a partir do preço de preenchimento (fora da Mola)
-input double DistanciaGridMola   = 150.0;   // [NÃO USADO no momento] Mola agora mantém o mesmo espaçamento (DistanciaGrid), só dobra a quantidade
+input double DistanciaGridMola   = 150.0;   // [NÃO USADO no momento]
 input double MolaPontos          = 50.0;    // Distância da saída consolidada a partir do preço médio, durante a Mola
-input string MolaProgressaoLotes = "2,3,4,5,10"; // Progressão de lotes a partir da ativação da Mola (demais usam QuantidadePorOrdem)
+input string MolaProgressaoLotes = "1,1,2,2,3,3,4,4,5,5,5,5,4,4,3,3,2,2,1,1"; // Lotes TOTAIS por nível (1 a 20) na Mola
+input string MolaProgressaoOCO   = "1,1,1,1,2,2,3,3,4,4,4,4,3,3,2,2,1,1,1,1"; // Lotes OCO individuais por nível (1 a 20) na Mola
 input double DistanciaDescargaBalde = 50.0; // [DESATIVADO] Evita vendas no prejuízo
 input double ToleranciaDescarga  = 25.0;    // [DESATIVADO]
-input double QuantidadePorOrdem  = 1;       // Contratos padrão por ordem/nível
+input double QuantidadePorOrdem  = 1;       // Contratos padrão por ordem/nível fora da Mola
 input int    PeriodoPuckAgressao = 21;      // Deve bater com o período configurado no indicador
 input bool   ReconstruirHistorico = true;   // Deve bater com o parâmetro do indicador
 input int    DiasHistoricoTicks   = 2;      // Deve bater com o parâmetro do indicador
 input int    PeriodoTPV          = 50;      // Deve bater com o período configurado no indicador TPV
 input double StopFinanceiro      = 5000.0;  // Perda máxima em R$ (lucro flutuante + swap) antes de fechar tudo
-input int    MagicNumber         = 198200;  // Identificador das ordens deste EA (diferente do v1: 198198 e do v2: 198199)
+input int    MagicNumber         = 198200;  // Identificador das ordens deste EA (v3: 198200)
 
 int    handlePuck       = INVALID_HANDLE;
 int    handleTPV        = INVALID_HANDLE;
@@ -128,36 +129,73 @@ int    g_totalNiveis     = 0;  // contagem de unidades preenchidas no ciclo atua
 bool   g_baldeExiste     = false; // o "balde" (saída consolidada em preço médio ± MolaPontos) persiste no ciclo inteiro
 double g_baldeVolume     = 0.0;   // volume acumulado dentro do balde até agora
 ulong  g_baldeTicket     = 0;     // ticket da ordem pendente que representa o balde, pra distinguir de OCOs individuais
-int    g_niveisDescarregados = 0; // quantos limiares (múltiplos de DistanciaDescargaBalde contra) já descarregaram 1 unidade do balde
+int    g_niveisDescarregados = 0; // [DESATIVADO]
 long   g_ultimaContaConhecida = 0; // detecta troca de conta/corretora sem reinício do EA (ver VerificarTrocaDeConta)
 
-double g_molaLotes[];
-int    g_totalMolaLotes = 0;
+double g_molaTotalLotes[];
+double g_molaOcoLotes[];
+int    g_totalMolaNiveisTotal = 0;
+int    g_totalMolaNiveisOCO   = 0;
 
 void CarregarProgressaoMola()
 {
-   string itens[];
-   int total = StringSplit(MolaProgressaoLotes, ',', itens);
-   ArrayResize(g_molaLotes, total);
-   g_totalMolaLotes = 0;
-
+   // Carrega sequência de Lotes Totais
+   string itensTotal[];
+   int total = StringSplit(MolaProgressaoLotes, ',', itensTotal);
+   ArrayResize(g_molaTotalLotes, total);
+   g_totalMolaNiveisTotal = 0;
    for(int i = 0; i < total; i++)
    {
-      StringTrimLeft(itens[i]);
-      StringTrimRight(itens[i]);
-      double val = StringToDouble(itens[i]);
+      StringTrimLeft(itensTotal[i]);
+      StringTrimRight(itensTotal[i]);
+      double val = StringToDouble(itensTotal[i]);
       if(val > 0)
       {
-         g_molaLotes[g_totalMolaLotes] = val;
-         g_totalMolaLotes++;
+         g_molaTotalLotes[g_totalMolaNiveisTotal] = val;
+         g_totalMolaNiveisTotal++;
+      }
+   }
+
+   // Carrega sequência de Lotes OCO
+   string itensOCO[];
+   int totalOCO = StringSplit(MolaProgressaoOCO, ',', itensOCO);
+   ArrayResize(g_molaOcoLotes, totalOCO);
+   g_totalMolaNiveisOCO = 0;
+   for(int i = 0; i < totalOCO; i++)
+   {
+      StringTrimLeft(itensOCO[i]);
+      StringTrimRight(itensOCO[i]);
+      double val = StringToDouble(itensOCO[i]);
+      if(val > 0)
+      {
+         g_molaOcoLotes[g_totalMolaNiveisOCO] = val;
+         g_totalMolaNiveisOCO++;
       }
    }
 }
 
-double ObterLoteMola(int indicePasso)
+void ObterLotesPorNivel(int nivel, double &totalLotes, double &ocoLotes, double &baldeLotes)
 {
-   if(indicePasso >= 0 && indicePasso < g_totalMolaLotes)
-      return g_molaLotes[indicePasso];
+   if(nivel >= 1 && nivel <= g_totalMolaNiveisTotal)
+      totalLotes = g_molaTotalLotes[nivel - 1];
+   else
+      totalLotes = QuantidadePorOrdem;
+
+   if(nivel >= 1 && nivel <= g_totalMolaNiveisOCO)
+      ocoLotes = g_molaOcoLotes[nivel - 1];
+   else
+      ocoLotes = totalLotes;
+
+   if(ocoLotes > totalLotes)
+      ocoLotes = totalLotes;
+
+   baldeLotes = totalLotes - ocoLotes;
+}
+
+double ObterTotalLotePorNivel(int nivel)
+{
+   if(nivel >= 1 && nivel <= g_totalMolaNiveisTotal)
+      return g_molaTotalLotes[nivel - 1];
 
    return QuantidadePorOrdem;
 }
@@ -241,10 +279,24 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       // precisamos disso só pra saber quantos níveis de grid já foram preenchidos.
       g_totalNiveis++;
 
+      bool ehCompra = (tipoDeal == DEAL_TYPE_BUY);
+
       if(g_baldeExiste || g_molaAtiva)
       {
-         // O balde JÁ EXISTE ou a Mola está ativa: todo novo preenchimento
-         // é incorporado diretamente ao balde consolidado em preço médio ± MolaPontos
+         // Determina o nível do grid com base na distância de preço da entrada
+         int nivel = (DistanciaGrid > 0 && preco_entrada > 0) ? (int)MathRound(MathAbs(preco_entrada - precoDeal) / DistanciaGrid) : 0;
+
+         double totalL = volumeDeal, ocoL = volumeDeal, baldeL = 0;
+         if(nivel >= 1)
+            ObterLotesPorNivel(nivel, totalL, ocoL, baldeL);
+
+         // Lança OCO individual apenas para a cota de OCO deste nível (se > 0)
+         if(ocoL > 0)
+         {
+            ColocarSaidaOCO(ehCompra, precoDeal, ocoL);
+         }
+
+         // Atualiza o balde consolidado cobrindo o restante
          AtualizarBalde();
       }
       else if(tipoDeal == DEAL_TYPE_BUY)
@@ -319,28 +371,30 @@ void TratarSaidaOCO(long tipoDealSaida, double precoSaida, double volumeSaida)
 
    if(aindaTemPosicao)
    {
-      // O volume do recarregamento segue o estado ATUAL da Mola, não o volume
-      // que acabou de sair — se a Mola estiver ligada agora, recarrega em 2x.
-      double volumeRecarga = g_molaAtiva ? (QuantidadePorOrdem * 2.0) : QuantidadePorOrdem;
       double precoEntradaReconstruido;
+      if(tipoDealSaida == DEAL_TYPE_SELL)
+         precoEntradaReconstruido = NormalizarPreco(precoSaida - DistanciaGridSaida);
+      else
+         precoEntradaReconstruido = NormalizarPreco(precoSaida + DistanciaGridSaida);
+
+      int nivel = (DistanciaGrid > 0 && preco_entrada > 0) ? (int)MathRound(MathAbs(preco_entrada - precoEntradaReconstruido) / DistanciaGrid) : 1;
+      double volumeRecarga = g_molaAtiva ? ObterTotalLotePorNivel(nivel) : QuantidadePorOrdem;
       bool   ok;
 
       if(tipoDealSaida == DEAL_TYPE_SELL)
       {
          // era saída de um grid comprado -> recoloca a entrada de compra
-         precoEntradaReconstruido = NormalizarPreco(precoSaida - DistanciaGridSaida);
          ok = trade.BuyLimit(volumeRecarga, precoEntradaReconstruido, _Symbol);
       }
       else
       {
          // era saída de um grid vendido -> recoloca a entrada de venda
-         precoEntradaReconstruido = NormalizarPreco(precoSaida + DistanciaGridSaida);
          ok = trade.SellLimit(volumeRecarga, precoEntradaReconstruido, _Symbol);
       }
 
       if(ok)
-         Print("Nivel recarregado (", (g_molaAtiva ? "2x, Mola ligada" : "1x, padrão"), "): saida preenchida em ", DoubleToString(precoSaida, _Digits),
-               " -> nova entrada recolocada em ", DoubleToString(precoEntradaReconstruido, _Digits));
+         Print("Nivel ", nivel, " recarregado (", (g_molaAtiva ? (DoubleToString(volumeRecarga, 0) + " contratos, Mola ligada") : (DoubleToString(volumeRecarga, 0) + " contrato, padrão")), "): saida em ", DoubleToString(precoSaida, _Digits),
+               " -> nova entrada em ", DoubleToString(precoEntradaReconstruido, _Digits));
       else
          Print("Falha ao recarregar nivel em ", DoubleToString(precoEntradaReconstruido, _Digits), ": ", trade.ResultRetcodeDescription());
    }
@@ -348,10 +402,7 @@ void TratarSaidaOCO(long tipoDealSaida, double precoSaida, double volumeSaida)
    {
       // Essa era a última unidade aberta fora do balde: o ciclo inteiro fechou
       // via OCO individual (não pelo balde, não pelo stop). Não recarrega esse
-      // nível — limpa qualquer ordem remanescente (incluindo o balde, se ainda
-      // existir — caso raro/órfão: o balde tinha volume pendente sem posição
-      // correspondente pra cobrir, a corretora normalmente invalida sozinha,
-      // mas cancelamos por garantia).
+      // nível — limpa qualquer ordem remanescente.
       CancelarOrdensPendentes();
       LimparEstadoCiclo();
 
@@ -469,15 +520,12 @@ void AtivarMola()
 
    AtualizarBalde();
 
-   // Aplica a progressão de lotes nas pendentes de entrada que faltam a partir deste momento
+   // Aplica a progressão de lotes por nível nas pendentes de entrada que faltam a partir deste momento
    CancelarOrdensPorTipo(tipoEntradaPendente);
    int niveisPreenchidosGrid = g_totalNiveis - 1; // exclui a entrada a mercado (nível 0)
-   int passoMola = 0;
    for(int nivel = niveisPreenchidosGrid + 1; nivel <= NiveisGradiente; nivel++)
    {
-      double loteNivel = ObterLoteMola(passoMola);
-      passoMola++;
-
+      double loteNivel = ObterTotalLotePorNivel(nivel);
       double nivelPreco = NormalizarPreco(ehCompra ? (preco_entrada - nivel * DistanciaGrid) : (preco_entrada + nivel * DistanciaGrid));
       bool ok = ehCompra ? trade.BuyLimit(loteNivel, nivelPreco, _Symbol) : trade.SellLimit(loteNivel, nivelPreco, _Symbol);
 
@@ -485,8 +533,7 @@ void AtivarMola()
          Print("Mola: falha ao colocar nivel ", nivel, " com ", loteNivel, " contratos em ", DoubleToString(nivelPreco, _Digits), ": ", trade.ResultRetcodeDescription());
    }
 
-   Print("MOLA ATIVADA (", (ehCompra ? "compra" : "venda"), "). Pendentes ajustadas com progressao: ", MolaProgressaoLotes,
-         " (demais com ", QuantidadePorOrdem, "). Balde: volume=", g_baldeVolume);
+   Print("MOLA ATIVADA (", (ehCompra ? "compra" : "venda"), "). Pendentes ajustadas por nivel. Balde: volume=", g_baldeVolume);
 }
 
 //+------------------------------------------------------------------+
@@ -746,9 +793,9 @@ void OnTick()
       }
    }
 
-   // Puck_Agressao: buffer4=SinalC(compra_subindo), buffer5=SinalV(venda_subindo).
-   // media_pos/media_neg não são mais necessários aqui — o stop deixou de
-   // depender do Puck_Agressao (agora é só financeiro).
+   // Puck_Agressao:
+   //  SinalC (buffer 4): 1.0 = Verde Escuro (1º impulso), 2.0 = Verde Fraco (repique), 0.0 = Branco (caindo)
+   //  SinalV (buffer 5): 1.0 = Vermelho (1º impulso), 2.0 = Rosa Fraco (repique), 0.0 = Branco (caindo)
    double puckSinalCArr[], puckSinalVArr[];
 
    if(CopyBuffer(handlePuck, 4, 0, 1, puckSinalCArr) <= 0) return;
@@ -761,17 +808,20 @@ void OnTick()
    if(CopyBuffer(handleTPV, 4, 0, 1, tpvSinalVArr)  <= 0) return;
    if(CopyBuffer(handleTPV, 5, 0, 1, tpvSubindoArr) <= 0) return;
 
-   bool compra_subindo = (puckSinalCArr[0] == 1.0);
-   bool venda_subindo  = (puckSinalVArr[0] == 1.0);
-   bool compra_caindo  = !compra_subindo;
-   bool venda_caindo   = !venda_subindo;
-   bool TPV_comprado   = (tpvSinalCArr[0] == 1.0);
-   bool TPV_vendido    = (tpvSinalVArr[0] == 1.0);
-   bool TPV_subindo    = (tpvSubindoArr[0] == 1.0);
-   bool TPV_caindo     = !TPV_subindo;
+   bool compra_verde_escuro = (puckSinalCArr[0] == 1.0); // 1º impulso / Verde Escuro
+   bool venda_vermelho      = (puckSinalVArr[0] == 1.0); // 1º impulso / Vermelho
+   bool compra_subindo      = (puckSinalCArr[0] > 0.0);  // Qualquer impulso positivo
+   bool venda_subindo       = (puckSinalVArr[0] > 0.0);  // Qualquer impulso positivo
+   bool compra_caindo       = (puckSinalCArr[0] == 0.0);
+   bool venda_caindo        = (puckSinalVArr[0] == 0.0);
+   bool TPV_comprado        = (tpvSinalCArr[0] == 1.0);
+   bool TPV_vendido         = (tpvSinalVArr[0] == 1.0);
+   bool TPV_subindo         = (tpvSubindoArr[0] == 1.0);
+   bool TPV_caindo          = !TPV_subindo;
 
-   bool sinalCompra = compra_subindo && !venda_subindo && TPV_subindo;
-   bool sinalVenda  = venda_subindo  && !compra_subindo && TPV_caindo;
+   // Entrada Inicial: somente no 1º impulso da onda (Verde Escuro para compra, Vermelho para venda)
+   bool sinalCompra = compra_verde_escuro && venda_caindo && TPV_subindo;
+   bool sinalVenda  = venda_vermelho && compra_caindo && TPV_caindo;
 
    // Mola (v3): Ativação e Desativação mutuamente exclusivas para evitar oscilação rápida (flapping)
    bool molaAtivaCompra    = TPV_caindo  || (compra_caindo && venda_subindo);
@@ -796,14 +846,14 @@ void OnTick()
 
       if(sinalCompra)
       {
-         Print("Sinal de entrada COMPRA: compra_subindo=", compra_subindo,
-               " venda_subindo=", venda_subindo, " TPV_subindo=", TPV_subindo);
+         Print("Sinal de entrada COMPRA (1º impulso Verde Escuro): compra_verde_escuro=", compra_verde_escuro,
+               " venda_caindo=", venda_caindo, " TPV_subindo=", TPV_subindo);
          AbrirGrid(ORDER_TYPE_BUY);
       }
       else if(sinalVenda)
       {
-         Print("Sinal de entrada VENDA: venda_subindo=", venda_subindo,
-               " compra_subindo=", compra_subindo, " TPV_caindo=", TPV_caindo);
+         Print("Sinal de entrada VENDA (1º impulso Vermelho): venda_vermelho=", venda_vermelho,
+               " compra_caindo=", compra_caindo, " TPV_caindo=", TPV_caindo);
          AbrirGrid(ORDER_TYPE_SELL);
       }
       // se nenhum dos dois lados bater todas as condições, não entra
