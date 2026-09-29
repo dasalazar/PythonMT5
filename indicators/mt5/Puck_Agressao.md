@@ -43,13 +43,17 @@ $$\text{MediaPos}[i] = \text{MediaPos}[i-1] + \alpha \times (\text{agress\_pos} 
 $$\text{MediaNeg}[i] = \text{MediaNeg}[i-1] + \alpha \times (\text{agress\_neg} - \text{MediaNeg}[i-1])$$
 
 ### 3.4. Regras de Sinais e Coloração
-As linhas possuem regras diretas de inclinação e coloração:
+As linhas possuem regras independentes de inclinação e histórico de impulsos dentro da onda:
 - **Linha de Compra (`MediaPos`)**:
-  - `compra_subindo`: $\text{MediaPos}[i] \ge \min(\text{MediaPos}[i-1], \text{MediaPos}[i-2])$ $\rightarrow$ **Verde Escuro** (`clrForestGreen`, $\text{SinalC} = 1.0$, `CorPosBuffer = 0`).
-  - `compra_caindo`: $\text{MediaPos}[i] < \min(\text{MediaPos}[i-1], \text{MediaPos}[i-2])$ $\rightarrow$ **Branco** (`clrWhite`, $\text{SinalC} = 0.0$, `CorPosBuffer = 1`).
+  - `compra_subindo`: $\text{MediaPos}[i] > 0.0001$ E $\text{MediaPos}[i] > \min(\text{MediaPos}[i-1], \text{MediaPos}[i-2])$
+    - Se é o **1º impulso de subida da onda** (ainda não houve queda após subir nesta onda) $\rightarrow$ **Verde Escuro** (`clrForestGreen`, $\text{SinalC} = 1.0$, `CorPosBuffer = 0`).
+    - Se está subindo **após já ter caído nesta mesma onda** (repique) $\rightarrow$ **Verde Claro** (`clrPaleGreen`, $\text{SinalC} = 2.0$, `CorPosBuffer = 2`).
+  - `compra_caindo / inativo`: $\rightarrow$ **Branco** (`clrWhite`, $\text{SinalC} = 0.0$, `CorPosBuffer = 1`).
 - **Linha de Venda (`MediaNeg`)**:
-  - `venda_subindo`: $\text{MediaNeg}[i] \ge \min(\text{MediaNeg}[i-1], \text{MediaNeg}[i-2])$ $\rightarrow$ **Vermelho** (`clrRed`, $\text{SinalV} = 1.0$, `CorNegBuffer = 0`).
-  - `venda_caindo`: $\text{MediaNeg}[i] < \min(\text{MediaNeg}[i-1], \text{MediaNeg}[i-2])$ $\rightarrow$ **Branco** (`clrWhite`, $\text{SinalV} = 0.0$, `CorNegBuffer = 1`).
+  - `venda_subindo`: $\text{MediaNeg}[i] > 0.0001$ E $\text{MediaNeg}[i] > \min(\text{MediaNeg}[i-1], \text{MediaNeg}[i-2])$
+    - Se é o **1º impulso de subida da onda** $\rightarrow$ **Vermelho** (`clrRed`, $\text{SinalV} = 1.0$, `CorNegBuffer = 0`).
+    - Se está subindo **após já ter caído nesta mesma onda** (repique) $\rightarrow$ **Rosa Fraco** (`clrLightPink`, $\text{SinalV} = 2.0$, `CorNegBuffer = 2`).
+  - `venda_caindo / inativo`: $\rightarrow$ **Branco** (`clrWhite`, $\text{SinalV} = 0.0$, `CorNegBuffer = 1`).
 
 ---
 
@@ -58,8 +62,8 @@ As linhas possuem regras diretas de inclinação e coloração:
 | Buffer Index | Nome Interno | Tipo | Descrição / Valores |
 | :---: | :--- | :--- | :--- |
 | `0` | `MediaPosBuffer` | `INDICATOR_DATA` | Valor numérico da EMA de Agressão Compradora. |
-| `1` | `CorPosBuffer` | `INDICATOR_COLOR_INDEX` | Índice de cor da linha compradora (`0` = Verde Escuro, `1` = Branco). |
+| `1` | `CorPosBuffer` | `INDICATOR_COLOR_INDEX` | Índice de cor da linha compradora (`0` = Verde Escuro, `1` = Branco, `2` = Verde Claro). |
 | `2` | `MediaNegBuffer` | `INDICATOR_DATA` | Valor numérico da EMA de Agressão Vendedora. |
-| `3` | `CorNegBuffer` | `INDICATOR_COLOR_INDEX` | Índice de cor da linha vendedora (`0` = Vermelho, `1` = Branco). |
-| `4` | `SinalC` | `INDICATOR_CALCULATIONS` | `1.0` = Compra Subindo (Verde Escuro), `0.0` = Compra Caindo (Branco). |
-| `5` | `SinalV` | `INDICATOR_CALCULATIONS` | `1.0` = Venda Subindo (Vermelho), `0.0` = Venda Caindo (Branco). |
+| `3` | `CorNegBuffer` | `INDICATOR_COLOR_INDEX` | Índice de cor da linha vendedora (`0` = Vermelho, `1` = Branco, `2` = Rosa Fraco). |
+| `4` | `SinalC` | `INDICATOR_CALCULATIONS` | `1.0` = 1º Impulso Compra (Verde Escuro), `2.0` = Repique Compra (Verde Claro), `0.0` = Inativo/Caindo (Branco). |
+| `5` | `SinalV` | `INDICATOR_CALCULATIONS` | `1.0` = 1º Impulso Venda (Vermelho), `2.0` = Repique Venda (Rosa Fraco), `0.0` = Inativo/Caindo (Branco). |

@@ -797,41 +797,36 @@ void OnTick()
    }
 
    // Puck_Agressao:
-   //  SinalC (buffer 4): 1.0 = Verde Escuro (compra subindo), 0.0 = Branco (compra caindo)
-   //  SinalV (buffer 5): 1.0 = Vermelho (venda subindo), 0.0 = Branco (venda caindo)
+   //  SinalC (buffer 4): 1.0 = Verde Escuro (1º impulso), 2.0 = Verde Claro (repique), 0.0 = Branco (caindo)
+   //  SinalV (buffer 5): 1.0 = Vermelho (1º impulso), 2.0 = Rosa Fraco (repique), 0.0 = Branco (caindo)
    double puckSinalCArr[], puckSinalVArr[];
 
    if(CopyBuffer(handlePuck, 4, 0, 1, puckSinalCArr) <= 0) return;
    if(CopyBuffer(handlePuck, 5, 0, 1, puckSinalVArr) <= 0) return;
 
-   // TPV_SMA: buffer3=SinalC(TPV_comprado), buffer4=SinalV(TPV_vendido), buffer5=TPVSubindo
-   double tpvSinalCArr[], tpvSinalVArr[], tpvSubindoArr[];
+   // TPV_SMA: buffer 1 = CorTPV (0=Verde / Comprado+Subindo, 1=Vermelho / Vendido+Caindo, 2=Branco)
+   double tpvCorArr[];
+   if(CopyBuffer(handleTPV, 1, 0, 1, tpvCorArr) <= 0) return;
 
-   if(CopyBuffer(handleTPV, 3, 0, 1, tpvSinalCArr)  <= 0) return;
-   if(CopyBuffer(handleTPV, 4, 0, 1, tpvSinalVArr)  <= 0) return;
-   if(CopyBuffer(handleTPV, 5, 0, 1, tpvSubindoArr) <= 0) return;
-
-   bool compra_verde_escuro = (puckSinalCArr[0] == 1.0); // Puck Comprador Verde Escuro
-   bool venda_vermelho      = (puckSinalVArr[0] == 1.0); // Puck Vendedor Vermelho
-   bool compra_subindo      = compra_verde_escuro;
-   bool venda_subindo       = venda_vermelho;
+   bool compra_verde_escuro = (puckSinalCArr[0] == 1.0); // Puck Comprador Verde Escuro (1º impulso)
+   bool venda_vermelho      = (puckSinalVArr[0] == 1.0); // Puck Vendedor Vermelho (1º impulso)
+   bool compra_subindo      = (puckSinalCArr[0] > 0.0);  // Puck Comprador ativo (Verde Escuro ou Claro)
+   bool venda_subindo       = (puckSinalVArr[0] > 0.0);  // Puck Vendedor ativo (Vermelho ou Rosa)
    bool compra_caindo       = (puckSinalCArr[0] == 0.0); // Puck Comprador Branco
    bool venda_caindo        = (puckSinalVArr[0] == 0.0); // Puck Vendedor Branco
-   bool TPV_comprado        = (tpvSinalCArr[0] == 1.0);
-   bool TPV_vendido         = (tpvSinalVArr[0] == 1.0);
-   bool TPV_subindo         = (tpvSubindoArr[0] == 1.0);
-   bool TPV_caindo          = !TPV_subindo;
+   bool TPV_verde           = (tpvCorArr[0] == 0.0);     // TPV Comprado + Subindo (Verde)
+   bool TPV_vermelho        = (tpvCorArr[0] == 1.0);     // TPV Vendido + Caindo (Vermelho)
 
    // Entrada / Reentrada:
-   //  - Compra: Puck Comprador Verde Escuro + Puck Vendedor Caindo (Branco) + TPV Subindo
-   //  - Venda:  Puck Vendedor Vermelho + Puck Comprador Caindo (Branco) + TPV Caindo
-   bool sinalCompra = compra_verde_escuro && venda_caindo && TPV_subindo;
-   bool sinalVenda  = venda_vermelho && compra_caindo && TPV_caindo;
+   //  - Compra: Puck Verde Escuro (1º impulso) + TPV Verde
+   //  - Venda:  Puck Vermelho (1º impulso) + TPV Vermelho
+   bool sinalCompra = compra_verde_escuro && TPV_verde;
+   bool sinalVenda  = venda_vermelho && TPV_vermelho;
 
    // Mola (v3): Ativação e Desativação mutuamente exclusivas para evitar oscilação rápida (flapping)
-   bool molaAtivaCompra    = TPV_caindo  || (compra_caindo && venda_subindo);
+   bool molaAtivaCompra    = TPV_vermelho || (compra_caindo && venda_subindo);
    bool molaDesativaCompra = !molaAtivaCompra;
-   bool molaAtivaVenda     = TPV_subindo || (venda_caindo && compra_subindo);
+   bool molaAtivaVenda     = TPV_verde    || (venda_caindo && compra_subindo);
    bool molaDesativaVenda  = !molaAtivaVenda;
 
    if(!PositionSelect(_Symbol))
@@ -851,14 +846,14 @@ void OnTick()
 
       if(sinalCompra)
       {
-         Print("Sinal de entrada COMPRA (Puck Verde + TPV subindo): compra_verde=", compra_verde_escuro,
-               " venda_caindo=", venda_caindo, " TPV_subindo=", TPV_subindo);
+         Print("Sinal de entrada COMPRA (Puck Verde Escuro + TPV Verde): compra_verde_escuro=", compra_verde_escuro,
+               " TPV_verde=", TPV_verde);
          AbrirGrid(ORDER_TYPE_BUY);
       }
       else if(sinalVenda)
       {
-         Print("Sinal de entrada VENDA (Puck Vermelho + TPV caindo): venda_vermelho=", venda_vermelho,
-               " compra_caindo=", compra_caindo, " TPV_caindo=", TPV_caindo);
+         Print("Sinal de entrada VENDA (Puck Vermelho + TPV Vermelho): venda_vermelho=", venda_vermelho,
+               " TPV_vermelho=", TPV_vermelho);
          AbrirGrid(ORDER_TYPE_SELL);
       }
       // se nenhum dos dois lados bater todas as condições, não entra
