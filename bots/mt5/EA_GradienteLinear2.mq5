@@ -1,0 +1,995 @@
+//+------------------------------------------------------------------+
+//|                                     EA_GradienteLinear2.mq5      |
+//| Robô de grid (Gradiente Linear) — v2, ponto de partida idêntico  |
+//| ao EA_GradienteLinear.mq5 (v1), que continua intocado e rodando  |
+//| como está. Este arquivo é onde as próximas evoluções entram.     |
+//|                                                                    |
+//| Entrada: automática, combinando os indicadores Puck_Agressao e    |
+//| TPV (a trava extra contra entrada+stop simultâneo já incluída).   |
+//| "Não posicionado" é garantido estruturalmente (só entra dentro do |
+//| bloco !PositionSelect), não precisa ser uma condição explícita.   |
+//| O TPV entra pela dimensão Subindo/Caindo, não Comprado/Vendido:   |
+//|   Sinal Compra = compra_subindo E NÃO venda_subindo E TPV_subindo |
+//|   Sinal Venda  = venda_subindo  E NÃO compra_subindo E TPV_caindo |
+//|                                                                    |
+//| Mecanismo MOLA: estado defensivo intermediário, entre "sinal      |
+//| ainda ok" e o stop de verdade — cobre o caso de estar posicionado |
+//| e o TPV começar a desfavorecer a posição, sem que o stop tenha    |
+//| disparado ainda. Depende só da dimensão TPV_subindo/TPV_caindo    |
+//| (independente do Puck_Agressao):                                  |
+//|   Ativa (comprado): TPV_caindo  | Desativa: TPV_subindo           |
+//|   Ativa (vendido):  TPV_subindo | Desativa: TPV_caindo            |
+//| Como as duas são opostas exatas, é um estado que reflete o valor  |
+//| atual a cada tick, não um evento de borda único.                  |
+//|                                                                    |
+//| Ligada: pendentes de entrada que faltam mantêm o MESMO espaçamento|
+//| (DistanciaGrid), só a QUANTIDADE dobra (2x QuantidadePorOrdem).   |
+//| Cada preenchimento de um nível dobrado divide ao meio: metade vai |
+//| pra uma OCO individual normal (DistanciaGridSaida); a outra       |
+//| metade entra no "balde" — uma saída consolidada, sempre reposta   |
+//| no preço médio ATUAL da posição ± MolaPontos, com o volume         |
+//| acumulado. Se a metade individual de um nível dobrado bate o      |
+//| alvo dela, recarrega aquele nível — de novo em 2x, se a Mola      |
+//| ainda estiver ligada nesse momento.                                |
+//|                                                                    |
+//| O BALDE PERSISTE o ciclo inteiro — nunca é cancelado só por a      |
+//| Mola desligar. Ao desligar, só a quantidade das pendentes volta   |
+//| pra 1x; o balde fica parado, exatamente como está, esperando ser  |
+//| preenchido ou ser retomado numa próxima ativação (ligar de novo   |
+//| não cria um balde novo — soma ao que já existe).                  |
+//| Preenchimentos feitos com a Mola desligada usam OCO individual     |
+//| normal; ao religar, essas OCOs são varridas e somadas ao balde.   |
+//| Se o balde preencher (total ou parcial), reduz o volume dele; se   |
+//| a posição zerar por causa dele, encerra o ciclo inteiro.           |
+//|                                                                    |
+//| Saída híbrida (fora da Mola):                                     |
+//|  1) OCO por nível: cada unidade preenchida (entrada a mercado ou  |
+//|     nível de grid) ganha sua própria ordem de saída (limit),      |
+//|     DistanciaGridSaida pontos de lucro a partir do preço real     |
+//|     daquele preenchimento — igual ao OCO do NTSL original.        |
+//|  2) Stop FINANCEIRO — não depende mais de indicador nenhum. Fecha |
+//|     a posição inteira quando a perda flutuante (lucro + swap)     |
+//|     atinge -StopFinanceiro (padrão R$ 5.000,00). Tem prioridade   |
+//|     sobre a Mola, fecha tudo independente do estado. Cancela      |
+//|     TODAS as ordens pendentes restantes (níveis de grid não       |
+//|     preenchidos + saídas OCO/consolidada ainda não preenchidas).  |
+//|                                                                    |
+//| Grid: réplica da config atual (NiveisGradiente=50, sem stop de    |
+//|       preço) — se o sinal não reverter e o preço não recuperar    |
+//|       nenhum nível, a posição fica exposta até o limite do grid.  |
+//|                                                                    |
+//| Requer Puck_Agressao.mq5 e TPV_SMA.mq5 já compilados em           |
+//| MQL5/Indicators/dsalazar. Assume conta em modo NETTING (padrão    |
+//| para B3) — uma única posição agregada por ativo, não hedging.     |
+//|                                                                    |
+//| MagicNumber padrão diferente do v1 (198199 em vez de 198198) —    |
+//| pra rodar os dois EAs ao mesmo tempo, no mesmo símbolo, sem um     |
+//| interferir nas ordens do outro, caso você queira comparar lado a  |
+//| lado antes de aposentar o v1.                                     |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//+------------------------------------------------------------------+
+//| Normaliza um preço calculado (soma/subtração/multiplicação) pra a |
+//| grade de tick real do símbolo. Necessário porque médias e contas  |
+//| aritméticas podem gerar valores que não existem na grade de       |
+//| preços do ativo (ex: preço médio de posição no WDO) — sem isso, o |
+//| MT5 rejeita a ordem com "invalid price". NÃO usar NormalizeDouble |
+//| sozinho pra isso — ele só arredonda casas decimais, não alinha ao |
+//| tick size real, que pode ser diferente (0.5, 5.0, etc).           |
+//+------------------------------------------------------------------+
+double NormalizarPreco(double preco)
+{
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize <= 0)
+      return(NormalizeDouble(preco, _Digits));
+
+   return(NormalizeDouble(MathRound(preco / tickSize) * tickSize, _Digits));
+}
+
+input int    NiveisGradiente     = 50;      // Níveis máximos do grid
+input double DistanciaGrid       = 75.0;    // Distância entre níveis de ENTRADA (pontos de preço)
+input double DistanciaGridSaida  = 100.0;   // Distância da saída OCO individual, a partir do preço de preenchimento (fora da Mola)
+input double DistanciaGridMola   = 150.0;   // [NÃO USADO no momento] Mola agora mantém o mesmo espaçamento (DistanciaGrid), só dobra a quantidade
+input double MolaPontos          = 50.0;    // Distância da saída consolidada a partir do preço médio, durante a Mola
+input double ToleranciaDescarga  = 25.0;    // Margem de segurança ANTES de disparar a descarga (exige DistanciaGridSaida + isso de distância real cruzada)
+input double QuantidadePorOrdem  = 1;       // Contratos por ordem/nível
+input int    PeriodoPuckAgressao = 21;      // Deve bater com o período configurado no indicador
+input bool   ReconstruirHistorico = true;   // Deve bater com o parâmetro do indicador
+input int    DiasHistoricoTicks   = 2;      // Deve bater com o parâmetro do indicador
+input int    PeriodoTPV          = 50;      // Deve bater com o período configurado no indicador TPV
+input double StopFinanceiro      = 5000.0;  // Perda máxima em R$ (lucro flutuante + swap) antes de fechar tudo
+input int    MagicNumber         = 198199;  // Identificador das ordens deste EA (diferente do v1: 198198)
+
+int    handlePuck       = INVALID_HANDLE;
+int    handleTPV        = INVALID_HANDLE;
+double preco_entrada     = 0;
+int    niveis_colocados  = 0;
+int    direcao_atual     = 0;  // 0 = sem posição, 1 = comprado, -1 = vendido
+bool   g_fechandoPorStop = false; // true durante o FecharTudo(), pra OnTradeTransaction não recarregar níveis nesse caso
+bool   g_molaAtiva       = false;
+int    g_totalNiveis     = 0;  // contagem de unidades preenchidas no ciclo atual (inclui a entrada a mercado)
+
+bool   g_baldeExiste     = false; // o "balde" (saída consolidada em preço médio ± MolaPontos) persiste no ciclo inteiro
+double g_baldeVolume     = 0.0;   // volume acumulado dentro do balde até agora
+ulong  g_baldeTicket     = 0;     // ticket da ordem pendente que representa o balde, pra distinguir de OCOs individuais
+int    g_niveisDescarregados = 0; // quantos limiares (múltiplos de DistanciaGridSaida contra) já descarregaram 1 unidade do balde
+long   g_ultimaContaConhecida = 0; // detecta troca de conta/corretora sem reinício do EA (ver VerificarTrocaDeConta)
+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+   g_ultimaContaConhecida = AccountInfoInteger(ACCOUNT_LOGIN);
+
+   handlePuck = iCustom(_Symbol, PERIOD_CURRENT, "dsalazar\\Puck_Agressao", PeriodoPuckAgressao, ReconstruirHistorico, DiasHistoricoTicks);
+   if(handlePuck == INVALID_HANDLE)
+   {
+      Print("Falha ao carregar o indicador Puck_Agressao. Confirme que o arquivo está compilado em MQL5/Indicators/dsalazar.");
+      return(INIT_FAILED);
+   }
+
+   handleTPV = iCustom(_Symbol, PERIOD_CURRENT, "dsalazar\\TPV_SMA", PeriodoTPV);
+   if(handleTPV == INVALID_HANDLE)
+   {
+      Print("Falha ao carregar o indicador TPV_SMA. Confirme que o arquivo está compilado em MQL5/Indicators/dsalazar.");
+      return(INIT_FAILED);
+   }
+
+   // Reconstrói o estado se o EA for reiniciado com posição já aberta.
+   // Limitação conhecida: g_totalNiveis, g_molaAtiva e o balde (g_baldeExiste/
+   // g_baldeVolume/g_baldeTicket) NÃO são reconstruídos — o MT5 não guarda
+   // "quantos níveis já preencheram" nem "havia um balde em aberto" em lugar
+   // nenhum consultável. Reiniciar o EA no meio de um ciclo com Mola ativa (ou
+   // com um balde parado) pode deixar esse estado interno incorreto até o
+   // próximo ciclo começar do zero. Evite reiniciar o EA nessas condições.
+   if(PositionSelect(_Symbol))
+   {
+      direcao_atual    = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
+      preco_entrada    = PositionGetDouble(POSITION_PRICE_OPEN);
+      niveis_colocados = NiveisGradiente; // assume que os níveis já tinham sido colocados antes do restart
+      Print("EA reiniciado com posição já aberta. Estado reconstruído de forma aproximada — g_totalNiveis, Mola e balde ficam zerados.");
+   }
+
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason)
+{
+   if(handlePuck != INVALID_HANDLE)
+      IndicatorRelease(handlePuck);
+   if(handleTPV != INVALID_HANDLE)
+      IndicatorRelease(handleTPV);
+}
+
+//+------------------------------------------------------------------+
+//| Dispara a cada negócio executado na conta. Usado para detectar    |
+//| quando uma unidade é preenchida (entrada a mercado ou nível de    |
+//| grid) e colocar a saída OCO correspondente, no preço real do      |
+//| preenchimento — não no preço teórico do nível.                    |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                         const MqlTradeRequest &request,
+                         const MqlTradeResult &result)
+{
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+
+   if(!HistoryDealSelect(trans.deal))
+      return;
+
+   if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol)
+      return;
+
+   if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != MagicNumber)
+      return;
+
+   ENUM_DEAL_ENTRY entrada  = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   long   tipoDeal   = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+   double precoDeal  = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+   double volumeDeal = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+
+   if(entrada == DEAL_ENTRY_IN)
+   {
+      // Toda entrada preenchida (mercado ou nível de grid) conta pro total do ciclo —
+      // precisamos disso só pra saber quantos níveis de grid já foram preenchidos.
+      g_totalNiveis++;
+
+      if(g_molaAtiva)
+      {
+         // Entrada duplicada (2x) enquanto a Mola está ligada: metade vira OCO
+         // individual normal, a outra metade se junta ao balde. O teto (evitar
+         // saída individual além de avg±MolaPontos) agora é checado dentro do
+         // próprio ColocarSaidaOCO, de forma universal — não precisa checar aqui.
+         double metade = volumeDeal / 2.0;
+
+         if(tipoDeal == DEAL_TYPE_BUY)
+            ColocarSaidaOCO(true, precoDeal, metade);
+         else
+            ColocarSaidaOCO(false, precoDeal, metade);
+
+         AtualizarBalde();
+      }
+      else if(tipoDeal == DEAL_TYPE_BUY)
+         ColocarSaidaOCO(true, precoDeal, volumeDeal);
+      else if(tipoDeal == DEAL_TYPE_SELL)
+         ColocarSaidaOCO(false, precoDeal, volumeDeal);
+
+      return;
+   }
+
+   if(entrada == DEAL_ENTRY_OUT && !g_fechandoPorStop)
+   {
+      ulong ordemOrigem = (ulong)HistoryDealGetInteger(trans.deal, DEAL_ORDER);
+
+      if(g_baldeExiste && ordemOrigem == g_baldeTicket)
+      {
+         // Foi o balde que preencheu (total ou parcialmente).
+         g_baldeVolume -= volumeDeal;
+         if(g_baldeVolume < 0.00000001)
+         {
+            g_baldeVolume = 0;
+            g_baldeExiste = false;
+            g_baldeTicket = 0;
+         }
+
+         if(!PositionSelect(_Symbol))
+         {
+            // Posição zerou de vez — encerra o ciclo inteiro.
+            CancelarOrdensPendentes();
+            LimparEstadoCiclo();
+
+            Print("Balde preencheu por completo e zerou a posição. Ciclo encerrado. Reentrada exige o sinal de entrada normal.");
+         }
+         // Se ainda sobra posição, foi um preenchimento parcial do balde —
+         // o restante continua pendente no mesmo preço, nada a fazer.
+
+         return;
+      }
+
+      // Não foi o balde: foi uma OCO individual preenchendo (saída de ordem
+      // intermediária). Recarrega o nível e, se a Mola estiver ligada, o
+      // volume da posição mudou — recalcula o balde pra refletir isso agora,
+      // não espera o próximo preenchimento de entrada.
+      TratarSaidaOCO(tipoDeal, precoDeal, volumeDeal);
+
+      if(g_molaAtiva)
+         AtualizarBalde();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Reage a uma saída OCO preenchida. Se ainda sobra posição aberta, |
+//| recarrega o nível (recoloca a entrada no mesmo preço). Se essa   |
+//| era a última unidade, encerra o ciclo e limpa ordens órfãs, para |
+//| o próximo grid (se o TPV continuar alinhado) nascer limpo.       |
+//+------------------------------------------------------------------+
+void TratarSaidaOCO(long tipoDealSaida, double precoSaida, double volumeSaida)
+{
+   bool aindaTemPosicao = PositionSelect(_Symbol);
+
+   // PositionSelect pode retornar falso MOMENTANEAMENTE logo após um
+   // preenchimento parcial, antes do registro da posição ser atualizado
+   // pelo terminal — confirma de novo (com uma pequena pausa) antes de
+   // declarar o ciclo encerrado e apagar todo o estado interno. Fazer
+   // isso sem confirmar já causou um bug real: o código concluiu "posição
+   // zerada" com a posição ainda viva, corrompendo direcao_atual/
+   // preco_entrada/g_totalNiveis e gerando um stop financeiro fictício.
+   if(!aindaTemPosicao)
+   {
+      Sleep(150);
+      aindaTemPosicao = PositionSelect(_Symbol);
+   }
+
+   if(aindaTemPosicao)
+   {
+      // O volume do recarregamento segue o estado ATUAL da Mola, não o volume
+      // que acabou de sair — se a Mola estiver ligada agora, recarrega em 2x.
+      double volumeRecarga = g_molaAtiva ? (QuantidadePorOrdem * 2.0) : QuantidadePorOrdem;
+      double precoEntradaReconstruido;
+      bool   ok;
+
+      if(tipoDealSaida == DEAL_TYPE_SELL)
+      {
+         // era saída de um grid comprado -> recoloca a entrada de compra
+         precoEntradaReconstruido = NormalizarPreco(precoSaida - DistanciaGridSaida);
+         ok = trade.BuyLimit(volumeRecarga, precoEntradaReconstruido, _Symbol);
+      }
+      else
+      {
+         // era saída de um grid vendido -> recoloca a entrada de venda
+         precoEntradaReconstruido = NormalizarPreco(precoSaida + DistanciaGridSaida);
+         ok = trade.SellLimit(volumeRecarga, precoEntradaReconstruido, _Symbol);
+      }
+
+      if(ok)
+         Print("Nivel recarregado (", (g_molaAtiva ? "2x, Mola ligada" : "1x, padrão"), "): saida preenchida em ", DoubleToString(precoSaida, _Digits),
+               " -> nova entrada recolocada em ", DoubleToString(precoEntradaReconstruido, _Digits));
+      else
+         Print("Falha ao recarregar nivel em ", DoubleToString(precoEntradaReconstruido, _Digits), ": ", trade.ResultRetcodeDescription());
+   }
+   else
+   {
+      // Essa era a última unidade aberta fora do balde: o ciclo inteiro fechou
+      // via OCO individual (não pelo balde, não pelo stop). Não recarrega esse
+      // nível — limpa qualquer ordem remanescente (incluindo o balde, se ainda
+      // existir — caso raro/órfão: o balde tinha volume pendente sem posição
+      // correspondente pra cobrir, a corretora normalmente invalida sozinha,
+      // mas cancelamos por garantia).
+      CancelarOrdensPendentes();
+      LimparEstadoCiclo();
+
+      Print("Ciclo encerrado: todas as unidades saíram via OCO individual. Ordens remanescentes canceladas. Reentrada depende do sinal de entrada no próximo tick.");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Coloca a ordem de saída (take-profit) de uma unidade específica,  |
+//| DistanciaGridSaida pontos a partir do preço real de preenchimento.|
+//|                                                                    |
+//| TETO UNIVERSAL: se existe um balde com volume (de qualquer        |
+//| ativação da Mola, mesmo que ela esteja desligada agora), e o alvo |
+//| individual ultrapassaria preço_médio ± MolaPontos, não cria a     |
+//| ordem individual — o volume vai direto pro balde (recalculado por |
+//| AtualizarBalde). Sem isso, ficaria uma ordem além do balde,       |
+//| inalcançável, já que o balde fecharia tudo antes dela.            |
+//+------------------------------------------------------------------+
+void ColocarSaidaOCO(bool ehCompra, double precoEntradaNivel, double volume)
+{
+   double alvoIndividual = ehCompra ? (precoEntradaNivel + DistanciaGridSaida) : (precoEntradaNivel - DistanciaGridSaida);
+
+   if(g_baldeVolume > 0 && PositionSelect(_Symbol))
+   {
+      double avgPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double teto      = ehCompra ? (avgPrice + MolaPontos) : (avgPrice - MolaPontos);
+      bool   ultrapassa = ehCompra ? (alvoIndividual > teto) : (alvoIndividual < teto);
+
+      if(ultrapassa)
+      {
+         Print("Saida individual em ", DoubleToString(alvoIndividual, _Digits),
+               " ultrapassaria o teto do balde (", DoubleToString(teto, _Digits), ") — indo direto pro balde.");
+         AtualizarBalde(); // recalcula sozinho: esse volume não tem ordem individual, então já entra como balde
+         return;
+      }
+   }
+
+   double precoSaida;
+   bool   ok;
+
+   if(ehCompra)
+   {
+      precoSaida = NormalizarPreco(precoEntradaNivel + DistanciaGridSaida);
+      ok = trade.SellLimit(volume, precoSaida, _Symbol);
+   }
+   else
+   {
+      precoSaida = NormalizarPreco(precoEntradaNivel - DistanciaGridSaida);
+      ok = trade.BuyLimit(volume, precoSaida, _Symbol);
+   }
+
+   if(ok)
+      Print("Saida OCO colocada: nivel preenchido em ", DoubleToString(precoEntradaNivel, _Digits),
+            " -> alvo de saida em ", DoubleToString(precoSaida, _Digits));
+   else
+      Print("Falha ao colocar saida OCO em ", DoubleToString(precoSaida, _Digits), ": ", trade.ResultRetcodeDescription());
+}
+
+//+------------------------------------------------------------------+
+//| Soma o volume de todas as ordens pendentes de um tipo específico  |
+//| (as OCOs individuais), EXCLUINDO o ticket do balde. Usado pra     |
+//| recalcular o volume do balde a partir da invariante: volume da    |
+//| posição = volume no balde + volume ainda coberto por individuais. |
+//+------------------------------------------------------------------+
+double SomarVolumeIndividualPendente(ENUM_ORDER_TYPE tipo)
+{
+   double soma = 0;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+      if((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) != tipo) continue;
+      if(g_baldeTicket != 0 && ticket == g_baldeTicket) continue;
+
+      soma += OrderGetDouble(ORDER_VOLUME_CURRENT);
+   }
+
+   return(soma);
+}
+
+//+------------------------------------------------------------------+
+//| Cancela só as ordens pendentes de um tipo específico (ex: só as   |
+//| BuyLimit, ou só as SellLimit) — usado pra mexer separadamente nas |
+//| pendentes de entrada e na(s) ordem(ns) de saída durante a Mola.   |
+//+------------------------------------------------------------------+
+void CancelarOrdensPorTipo(ENUM_ORDER_TYPE tipo, ulong ticketExcluir = 0)
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+      if((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) != tipo) continue;
+      if(ticketExcluir != 0 && ticket == ticketExcluir) continue;
+
+      trade.OrderDelete(ticket);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Ativa a Mola: varre as OCOs individuais existentes (preenchimentos|
+//| feitos com a Mola desligada) e soma o volume delas ao balde — sem |
+//| recriar um balde novo, se um já existir de um ciclo anterior de   |
+//| Mola ligada dentro da mesma posição. Dobra a QUANTIDADE das       |
+//| pendentes de entrada que faltam (mesmo espaçamento).              |
+//+------------------------------------------------------------------+
+void AtivarMola()
+{
+   g_molaAtiva = true;
+
+   bool ehCompra = (direcao_atual == 1);
+   ENUM_ORDER_TYPE tipoEntradaPendente = ehCompra ? ORDER_TYPE_BUY_LIMIT  : ORDER_TYPE_SELL_LIMIT;
+   ENUM_ORDER_TYPE tipoSaida           = ehCompra ? ORDER_TYPE_SELL_LIMIT : ORDER_TYPE_BUY_LIMIT;
+
+   // Cancela as OCOs individuais existentes (preservando o balde, se já
+   // existir) — depois disso, todo o volume da posição fica "descoberto",
+   // e o AtualizarBalde() logo abaixo recalcula o balde do zero, cobrindo
+   // automaticamente tudo que não tem mais OCO individual.
+   if(PositionSelect(_Symbol))
+      CancelarOrdensPorTipo(tipoSaida, g_baldeTicket);
+
+   AtualizarBalde();
+
+   // Dobra a quantidade das pendentes de entrada que faltam (mesmo espaçamento)
+   CancelarOrdensPorTipo(tipoEntradaPendente);
+   int niveisPreenchidosGrid = g_totalNiveis - 1; // exclui a entrada a mercado (nível 0)
+   for(int nivel = niveisPreenchidosGrid + 1; nivel <= NiveisGradiente; nivel++)
+   {
+      double nivelPreco = NormalizarPreco(ehCompra ? (preco_entrada - nivel * DistanciaGrid) : (preco_entrada + nivel * DistanciaGrid));
+      bool ok = ehCompra ? trade.BuyLimit(QuantidadePorOrdem * 2.0, nivelPreco, _Symbol) : trade.SellLimit(QuantidadePorOrdem * 2.0, nivelPreco, _Symbol);
+
+      if(!ok)
+         Print("Mola: falha ao dobrar nivel ", nivel, " em ", DoubleToString(nivelPreco, _Digits), ": ", trade.ResultRetcodeDescription());
+   }
+
+   Print("MOLA ATIVADA (", (ehCompra ? "compra" : "venda"), "). Pendentes dobradas pra ", QuantidadePorOrdem * 2.0,
+         " contratos, mesmo espaçamento. Balde: volume=", g_baldeVolume);
+}
+
+//+------------------------------------------------------------------+
+//| Recria a ordem do balde no preço médio ATUAL da posição ±          |
+//| MolaPontos, com o volume acumulado até agora. Chamada ao ativar a |
+//| Mola e a cada novo preenchimento que soma volume ao balde.        |
+//|                                                                    |
+//| IMPORTANTE: cria a ordem NOVA primeiro, só cancela a ANTIGA depois|
+//| de confirmar que a nova foi aceita — nunca ao contrário. Cancelar |
+//| primeiro e a criação da nova falhar deixaria o volume do balde    |
+//| sem NENHUMA ordem cobrindo, sem proteção nenhuma (foi exatamente  |
+//| isso que causou o balde "sumir" num teste real). Tenta até 3      |
+//| vezes antes de desistir, e mantém a ordem antiga se todas falharem.|
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Recria a ordem do balde no preço médio ATUAL da posição ±          |
+//| MolaPontos, com o volume recalculado DO ZERO a cada chamada:      |
+//| volume_balde = volume_da_posição - volume_ainda_coberto_por_OCOs_ |
+//| individuais_pendentes. Isso garante que o balde sempre reflita o  |
+//| volume real restante, mesmo que uma OCO individual tenha saído no |
+//| meio do caminho — não fica dependendo de um contador incrementado |
+//| aos poucos, que poderia dessincronizar.                           |
+//|                                                                    |
+//| Chamada em toda nova execução (entrada), aumento de posição, ou   |
+//| saída de ordem intermediária (OCO individual preenchendo) — pra   |
+//| que o preço médio + MolaPontos sempre cubra o fechamento de TODAS |
+//| as ordens ainda em aberto, sem risco de sobrar posição descoberta.|
+//|                                                                    |
+//+------------------------------------------------------------------+
+//| Cancela ordens individuais pendentes cujo preço já ultrapassa o   |
+//| teto do balde (preço médio ± MolaPontos) — acontece quando o      |
+//| preço médio se move DEPOIS que a ordem individual já tinha sido   |
+//| criada. Sem isso, ficaria uma ordem inalcançável (o balde fecha   |
+//| tudo antes dela).                                                  |
+//+------------------------------------------------------------------+
+void MigrarOrdensAlemDoTeto(ENUM_ORDER_TYPE tipo, double teto, bool ehCompra)
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+      if((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) != tipo) continue;
+      if(g_baldeTicket != 0 && ticket == g_baldeTicket) continue;
+
+      double precoOrdem = OrderGetDouble(ORDER_PRICE_OPEN);
+      bool   ultrapassa = ehCompra ? (precoOrdem > teto) : (precoOrdem < teto);
+
+      if(ultrapassa)
+      {
+         Print("Migrando ordem individual #", ticket, " em ", DoubleToString(precoOrdem, _Digits),
+               " pro balde — ultrapassava o teto (", DoubleToString(teto, _Digits), ").");
+         trade.OrderDelete(ticket);
+      }
+   }
+}
+
+void AtualizarBalde()
+{
+   bool ehCompra = (direcao_atual == 1);
+   ENUM_ORDER_TYPE tipoSaida = ehCompra ? ORDER_TYPE_SELL_LIMIT : ORDER_TYPE_BUY_LIMIT;
+
+   if(!PositionSelect(_Symbol))
+   {
+      if(g_baldeTicket != 0)
+         trade.OrderDelete(g_baldeTicket);
+
+      g_baldeTicket = 0;
+      g_baldeExiste = false;
+      g_baldeVolume = 0;
+      return;
+   }
+
+   double precoMedio = PositionGetDouble(POSITION_PRICE_OPEN);
+   double teto        = ehCompra ? (precoMedio + MolaPontos) : (precoMedio - MolaPontos);
+
+   MigrarOrdensAlemDoTeto(tipoSaida, teto, ehCompra);
+
+   double volumePosicao    = PositionGetDouble(POSITION_VOLUME);
+   double volumeIndividual = SomarVolumeIndividualPendente(tipoSaida);
+   double novoVolumeBalde  = volumePosicao - volumeIndividual;
+
+   if(novoVolumeBalde <= 0)
+   {
+      // Toda a posição já está coberta por OCOs individuais — sem necessidade de balde agora.
+      if(g_baldeVolume != 0 || g_baldeTicket != 0) // só mexe/loga se realmente havia algo a desfazer
+      {
+         g_baldeVolume = 0;
+         g_niveisDescarregados = 0; // um balde novo, mais tarde, recomeça a contagem dos limiares do zero
+         if(g_baldeTicket != 0)
+            trade.OrderDelete(g_baldeTicket);
+
+         g_baldeTicket = 0;
+         g_baldeExiste = false;
+      }
+      return;
+   }
+
+   double precoSaida = NormalizarPreco(teto);
+
+   // Como essa função agora roda todo tick (garantia contínua de que a soma
+   // das saídas bate com a posição), só recria a ordem se algo REALMENTE
+   // mudou — volume, preço, ou a ordem sumiu do book. Senão, não faz nada
+   // (evita recriar a mesma ordem repetidamente a cada tick sem necessidade).
+   bool   ordemAtualValida = (g_baldeTicket != 0) && OrderSelect(g_baldeTicket);
+   double volumeAtualOrdem = ordemAtualValida ? OrderGetDouble(ORDER_VOLUME_CURRENT) : -1;
+   double precoAtualOrdem  = ordemAtualValida ? OrderGetDouble(ORDER_PRICE_OPEN) : -1;
+   double tickSize         = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+
+   bool precisaRecriar = !ordemAtualValida ||
+                         (MathAbs(volumeAtualOrdem - novoVolumeBalde) > 0.0000001) ||
+                         (MathAbs(precoAtualOrdem - precoSaida) > (tickSize > 0 ? tickSize / 2.0 : 0.0000001));
+
+   g_baldeVolume = novoVolumeBalde;
+
+   if(!precisaRecriar)
+      return; // nada mudou de verdade — a ordem existente já reflete a realidade
+
+   ulong  ticketAntigo = g_baldeTicket;
+   bool   ok = false;
+
+   for(int tentativa = 1; tentativa <= 3 && !ok; tentativa++)
+   {
+      ok = ehCompra ? trade.SellLimit(g_baldeVolume, precoSaida, _Symbol) : trade.BuyLimit(g_baldeVolume, precoSaida, _Symbol);
+
+      if(!ok)
+      {
+         Print("Balde: tentativa ", tentativa, "/3 de criar a ordem nova falhou (", trade.ResultRetcodeDescription(), "). Tentando de novo...");
+         Sleep(200);
+      }
+   }
+
+   if(ok)
+   {
+      g_baldeTicket = trade.ResultOrder();
+      g_baldeExiste = true;
+
+      // Só cancela a antiga DEPOIS de confirmar que a nova foi criada —
+      // nunca deixa o volume sem nenhuma ordem cobrindo.
+      if(ticketAntigo != 0)
+         trade.OrderDelete(ticketAntigo);
+
+      Print("Balde recalculado: preco medio+/-", MolaPontos, " = ", DoubleToString(precoSaida, _Digits),
+            " | volume=", g_baldeVolume, " (posicao=", volumePosicao, " - individual=", volumeIndividual, ")");
+   }
+   else
+   {
+      Print("!!! ALERTA: falha ao atualizar o balde em ", DoubleToString(precoSaida, _Digits),
+            " após 3 tentativas (", trade.ResultRetcodeDescription(), "). ",
+            (ticketAntigo != 0 ? "Ordem antiga (#" + IntegerToString((long)ticketAntigo) + ") MANTIDA, mas pode não cobrir mais o volume atual do balde." :
+                                  "NENHUMA ordem cobrindo o balde agora — verifique o book manualmente."));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Descarga progressiva do balde: a cada DistanciaGridSaida pontos   |
+//| que o preço se afasta CONTRA a posição (cumulativo a partir do    |
+//| preço médio ATUAL, recalculado a cada tick), tira 1 unidade do    |
+//| balde e dá a ela uma saída própria exatamente no preço do limiar  |
+//| (avg ∓ N×DistanciaGridSaida) — não no preço atual, no limiar      |
+//| mesmo. ToleranciaDescarga reduz a distância exigida por limiar    |
+//| (uma "gordura" que antecipa o gatilho), pra evitar que ele fique  |
+//| difícil de cruzar quando o preço médio se move junto com o preço  |
+//| atual (posição crescendo rápido durante uma tendência forte).     |
+//| Quando o preço vai a favor, não faz nada. Chamada todo tick       |
+//| enquanto o balde tiver volume, independente da Mola estar ligada  |
+//| ou desligada no momento.                                          |
+//+------------------------------------------------------------------+
+void VerificarDescargaBalde()
+{
+   if(g_baldeVolume <= 0)
+      return;
+
+   if(!PositionSelect(_Symbol))
+      return;
+
+   bool   ehCompra   = (direcao_atual == 1);
+   double avgPrice   = PositionGetDouble(POSITION_PRICE_OPEN);
+   double precoAtual = ehCompra ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   // distância contra a posição (positiva = preço pior que o médio; negativa/zero = a favor, não descarrega)
+   double distanciaContra = ehCompra ? (avgPrice - precoAtual) : (precoAtual - avgPrice);
+   if(distanciaContra <= 0)
+      return;
+
+   // ToleranciaDescarga é uma margem de SEGURANÇA antes de disparar — exige
+   // (DistanciaGridSaida + ToleranciaDescarga) de distância real cruzada
+   // pra colocar a ordem no limiar teórico de DistanciaGridSaida. Ex: com
+   // tolerância de 25, só dispara o limiar de 100 quando o preço já se
+   // afastou 125 de verdade — evita disparar em cima da hora, bem no limite
+   // exato, dando mais confiança de que o movimento é real antes de agir.
+   double distanciaExigida = distanciaContra - ToleranciaDescarga;
+   int limiaresAtingidos = (distanciaExigida > 0) ? (int)MathFloor(distanciaExigida / DistanciaGridSaida) : 0;
+
+   while(g_niveisDescarregados < limiaresAtingidos && g_baldeVolume > 0)
+   {
+      int    proximoLimiar   = g_niveisDescarregados + 1;
+      double volumeUnidade   = MathMin(QuantidadePorOrdem, g_baldeVolume);
+      // O preço da ordem continua sendo o limiar TEÓRICO puro (sem a tolerância
+      // aplicada aqui) — a tolerância só antecipa QUANDO dispara, não ONDE a
+      // ordem é colocada.
+      double precoIndividual = NormalizarPreco(ehCompra ? (avgPrice - proximoLimiar * DistanciaGridSaida) : (avgPrice + proximoLimiar * DistanciaGridSaida));
+
+      bool ok = ehCompra ? trade.SellLimit(volumeUnidade, precoIndividual, _Symbol) : trade.BuyLimit(volumeUnidade, precoIndividual, _Symbol);
+
+      if(ok)
+      {
+         g_niveisDescarregados = proximoLimiar;
+         Print("Balde: descarregada 1 unidade (", volumeUnidade, ") no limiar ", g_niveisDescarregados,
+               " = ", DoubleToString(precoIndividual, _Digits), " (preço atual ", DoubleToString(precoAtual, _Digits),
+               ", distancia contra=", DoubleToString(distanciaContra, _Digits), ", tolerancia=", ToleranciaDescarga, ")");
+         AtualizarBalde(); // recalcula o balde restante já sem essa unidade
+      }
+      else
+      {
+         Print("Falha ao descarregar unidade do balde em ", DoubleToString(precoIndividual, _Digits), ": ", trade.ResultRetcodeDescription());
+         break; // não incrementa o limiar — tenta de novo no próximo tick
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Desativa a Mola SEM fechar a posição e SEM tocar no balde — ele   |
+//| fica exatamente como está, parado, esperando ser preenchido ou    |
+//| ser retomado numa próxima ativação. Só reverte a quantidade das   |
+//| pendentes de entrada que faltam, de volta pro padrão (1x).        |
+//+------------------------------------------------------------------+
+void DesativarMolaSemFechar()
+{
+   bool ehCompra = (direcao_atual == 1);
+   ENUM_ORDER_TYPE tipoEntradaPendente = ehCompra ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
+
+   CancelarOrdensPorTipo(tipoEntradaPendente);
+
+   int niveisPreenchidosGrid = g_totalNiveis - 1;
+   for(int nivel = niveisPreenchidosGrid + 1; nivel <= NiveisGradiente; nivel++)
+   {
+      double nivelPreco = NormalizarPreco(ehCompra ? (preco_entrada - nivel * DistanciaGrid) : (preco_entrada + nivel * DistanciaGrid));
+      bool ok = ehCompra ? trade.BuyLimit(QuantidadePorOrdem, nivelPreco, _Symbol) : trade.SellLimit(QuantidadePorOrdem, nivelPreco, _Symbol);
+
+      if(!ok)
+         Print("Desativar Mola: falha ao reverter nivel ", nivel, " em ", DoubleToString(nivelPreco, _Digits), ": ", trade.ResultRetcodeDescription());
+   }
+
+   g_molaAtiva = false;
+   Print("MOLA DESATIVADA. Pendentes voltaram pra ", QuantidadePorOrdem, " contrato(s). Balde MANTIDO (volume=", g_baldeVolume, "), sem cancelar.");
+}
+
+void OnTick()
+{
+   // Rede de segurança contra troca de conta/corretora sem reiniciar o EA:
+   // se a conta logada mudou desde a última checagem, TODO o estado interno
+   // (preco_entrada, direcao_atual, balde, etc.) pode estar se referindo à
+   // conta ANTERIOR — não confiável pra decisão nenhuma. Zera tudo.
+   long contaAtual = AccountInfoInteger(ACCOUNT_LOGIN);
+   if(g_ultimaContaConhecida != 0 && contaAtual != g_ultimaContaConhecida)
+   {
+      Print("!!! ALERTA: a conta logada mudou de #", g_ultimaContaConhecida, " para #", contaAtual,
+            " sem o EA reiniciar. Estado interno zerado por segurança — cancelando qualquer ordem pendente residual.");
+      CancelarOrdensPendentes();
+      LimparEstadoCiclo();
+   }
+   g_ultimaContaConhecida = contaAtual;
+
+   // Rede de segurança contra corrupção de direcao_atual (a causa raiz do
+   // bug real que já aconteceu: um "ciclo encerrado" prematuro zerou o
+   // estado com a posição ainda viva, e direcao_atual=0 foi então tratado
+   // como "venda" em toda a lógica da Mola/balde, mesmo com a posição real
+   // sendo comprada). Confere a cada tick se existe posição de verdade e se
+   // direcao_atual bate com ela — corrige na hora se não bater.
+   if(PositionSelect(_Symbol))
+   {
+      long tipoPosReal = PositionGetInteger(POSITION_TYPE);
+      int  direcaoReal = (tipoPosReal == POSITION_TYPE_BUY) ? 1 : -1;
+
+      if(direcao_atual != direcaoReal)
+      {
+         Print("!!! ALERTA: direcao_atual interna (", direcao_atual, ") não batia com a posição real (",
+               (direcaoReal == 1 ? "comprado" : "vendido"), "). Corrigido agora.");
+         direcao_atual = direcaoReal;
+
+         if(preco_entrada <= 0)
+            preco_entrada = PositionGetDouble(POSITION_PRICE_OPEN); // aproximação melhor que 0
+      }
+   }
+
+   // Puck_Agressao: buffer4=SinalC(compra_subindo), buffer5=SinalV(venda_subindo).
+   // media_pos/media_neg não são mais necessários aqui — o stop deixou de
+   // depender do Puck_Agressao (agora é só financeiro).
+   double puckSinalCArr[], puckSinalVArr[];
+
+   if(CopyBuffer(handlePuck, 4, 0, 1, puckSinalCArr) <= 0) return;
+   if(CopyBuffer(handlePuck, 5, 0, 1, puckSinalVArr) <= 0) return;
+
+   // TPV_SMA: buffer3=SinalC(TPV_comprado), buffer4=SinalV(TPV_vendido), buffer5=TPVSubindo
+   double tpvSinalCArr[], tpvSinalVArr[], tpvSubindoArr[];
+
+   if(CopyBuffer(handleTPV, 3, 0, 1, tpvSinalCArr)  <= 0) return;
+   if(CopyBuffer(handleTPV, 4, 0, 1, tpvSinalVArr)  <= 0) return;
+   if(CopyBuffer(handleTPV, 5, 0, 1, tpvSubindoArr) <= 0) return;
+
+   bool compra_subindo = (puckSinalCArr[0] == 1.0);
+   bool venda_subindo  = (puckSinalVArr[0] == 1.0);
+   bool TPV_comprado   = (tpvSinalCArr[0] == 1.0);
+   bool TPV_vendido    = (tpvSinalVArr[0] == 1.0);
+   bool TPV_subindo    = (tpvSubindoArr[0] == 1.0);
+   bool TPV_caindo     = !TPV_subindo;
+
+   bool sinalCompra = compra_subindo && !venda_subindo && TPV_subindo;
+   bool sinalVenda  = venda_subindo  && !compra_subindo && TPV_caindo;
+
+   // Mola: depende só da dimensão TPV_subindo/TPV_caindo (independente
+   // do Puck_Agressao) — comprado desfavorece quando TPV cai, vendido
+   // desfavorece quando TPV sobe. Ativação e desativação-B são espelhadas
+   // (TPV_subindo/TPV_caindo são opostos exatos), então é um estado que
+   // reflete o valor atual a cada tick, não um evento único.
+   bool molaCompra = TPV_caindo;
+   bool molaVenda  = TPV_subindo;
+
+   if(!PositionSelect(_Symbol))
+   {
+      // Rede de segurança: sem posição aberta, não deveria existir NENHUMA
+      // ordem pendente nossa (nem de entrada, nem OCO, nem balde). Se sobrou
+      // alguma órfã de um fechamento anterior (ex: um OrderDelete que falhou
+      // silenciosamente), limpa aqui antes de considerar qualquer entrada nova.
+      if(ExistemOrdensOrfas())
+      {
+         Print("Limpeza: encontradas ordens pendentes sem posição aberta. Cancelando antes de avaliar entrada.");
+         CancelarOrdensPendentes();
+      }
+
+      direcao_atual    = 0;
+      niveis_colocados = 0;
+
+      if(sinalCompra)
+      {
+         Print("Sinal de entrada COMPRA: compra_subindo=", compra_subindo,
+               " venda_subindo=", venda_subindo, " TPV_subindo=", TPV_subindo);
+         AbrirGrid(ORDER_TYPE_BUY);
+      }
+      else if(sinalVenda)
+      {
+         Print("Sinal de entrada VENDA: venda_subindo=", venda_subindo,
+               " compra_subindo=", compra_subindo, " TPV_caindo=", TPV_caindo);
+         AbrirGrid(ORDER_TYPE_SELL);
+      }
+      // se nenhum dos dois lados bater todas as condições, não entra
+
+      return;
+   }
+
+   long tipoPos = PositionGetInteger(POSITION_TYPE);
+
+   // Stop financeiro: não depende de indicador nenhum, só do resultado em R$.
+   double lucroFlutuante = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+
+   if(lucroFlutuante <= -MathAbs(StopFinanceiro))
+   {
+      Print("Sinal de STOP FINANCEIRO: lucro flutuante = ", DoubleToString(lucroFlutuante, 2),
+            " <= -", DoubleToString(MathAbs(StopFinanceiro), 2));
+      FecharTudo();
+      return;
+   }
+
+   // Stop não disparou. Verifica transições da Mola.
+   if(tipoPos == POSITION_TYPE_BUY)
+   {
+      if(!g_molaAtiva && molaCompra)
+      {
+         Print("Sinal de MOLA COMPRA (ativa): TPV_caindo=", TPV_caindo);
+         AtivarMola();
+      }
+      else if(g_molaAtiva && TPV_subindo)
+      {
+         Print("Sinal de MOLA COMPRA (desativa): TPV_subindo=", TPV_subindo);
+         DesativarMolaSemFechar();
+      }
+   }
+   else if(tipoPos == POSITION_TYPE_SELL)
+   {
+      if(!g_molaAtiva && molaVenda)
+      {
+         Print("Sinal de MOLA VENDA (ativa): TPV_subindo=", TPV_subindo);
+         AtivarMola();
+      }
+      else if(g_molaAtiva && TPV_caindo)
+      {
+         Print("Sinal de MOLA VENDA (desativa): TPV_caindo=", TPV_caindo);
+         DesativarMolaSemFechar();
+      }
+   }
+
+   // Nenhuma transição: nada a fazer.
+
+   // Descarga progressiva do balde (independente do estado atual da Mola —
+   // enquanto o balde tiver volume, ele continua exposto).
+   VerificarDescargaBalde();
+
+   // Garantia contínua: soma das saídas (individuais + balde) sempre bate
+   // com o tamanho real da posição. Roda todo tick, incondicionalmente —
+   // a própria função só recria a ordem se algo de fato mudou, então não
+   // tem custo real em chamar sempre em vez de só nos gatilhos específicos.
+   AtualizarBalde();
+}
+
+//+------------------------------------------------------------------+
+//| Confere se um ticket de ordem pendente ainda existe no book.      |
+//+------------------------------------------------------------------+
+bool OrdemAindaExiste(ulong ticket)
+{
+   if(ticket == 0)
+      return(false);
+
+   return(OrderSelect(ticket));
+}
+
+//+------------------------------------------------------------------+
+//| Abre a posição a mercado e pré-monta todos os níveis do grid     |
+//| como ordens pendentes, de uma vez (evita reenviar/duplicar a     |
+//| cada tick, que era um risco não confirmado no código NTSL).      |
+//+------------------------------------------------------------------+
+void AbrirGrid(ENUM_ORDER_TYPE tipo)
+{
+   bool enviado;
+
+   LimparEstadoCiclo(); // garante que não sobra estado do ciclo anterior
+
+   if(tipo == ORDER_TYPE_BUY)
+      enviado = trade.Buy(QuantidadePorOrdem, _Symbol);
+   else
+      enviado = trade.Sell(QuantidadePorOrdem, _Symbol);
+
+   if(!enviado)
+   {
+      Print("Falha ao enviar ordem a mercado: ", trade.ResultRetcodeDescription());
+      return;
+   }
+
+   preco_entrada    = trade.ResultPrice();
+   direcao_atual    = (tipo == ORDER_TYPE_BUY) ? 1 : -1;
+   niveis_colocados = 0;
+
+   for(int nivel = 1; nivel <= NiveisGradiente; nivel++)
+   {
+      double nivelPreco;
+      bool ok;
+
+      if(tipo == ORDER_TYPE_BUY)
+      {
+         nivelPreco = NormalizarPreco(preco_entrada - nivel * DistanciaGrid);
+         ok = trade.BuyLimit(QuantidadePorOrdem, nivelPreco, _Symbol);
+      }
+      else
+      {
+         nivelPreco = NormalizarPreco(preco_entrada + nivel * DistanciaGrid);
+         ok = trade.SellLimit(QuantidadePorOrdem, nivelPreco, _Symbol);
+      }
+
+      if(ok)
+         niveis_colocados++;
+      else
+         Print("Falha ao colocar nível ", nivel, " do grid em ", DoubleToString(nivelPreco, _Digits), ": ", trade.ResultRetcodeDescription());
+   }
+
+   Print("Grid aberto: ", (tipo == ORDER_TYPE_BUY ? "COMPRA" : "VENDA"),
+         " | entrada=", DoubleToString(preco_entrada, _Digits),
+         " | niveis colocados=", niveis_colocados, "/", NiveisGradiente);
+}
+
+//+------------------------------------------------------------------+
+//| Fecha a posição inteira de uma vez e cancela as ordens pendentes  |
+//| restantes do grid (equivalente ao ClosePosition do NTSL).         |
+//+------------------------------------------------------------------+
+void FecharTudo()
+{
+   g_fechandoPorStop = true;
+   trade.PositionClose(_Symbol);
+   CancelarOrdensPendentes();
+   g_fechandoPorStop = false;
+
+   Print("Posição fechada por STOP FINANCEIRO.");
+
+   LimparEstadoCiclo();
+}
+
+void CancelarOrdensPendentes()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+
+      if(!trade.OrderDelete(ticket))
+         Print("Falha ao cancelar ordem pendente #", ticket, ": ", trade.ResultRetcodeDescription());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Confere se existe alguma ordem pendente nossa (entrada, OCO ou    |
+//| balde) no book, sem checar posição — usado como rede de segurança |
+//| pra garantir a invariante "sem posição = sem ordens pendentes".   |
+//+------------------------------------------------------------------+
+bool ExistemOrdensOrfas()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+
+      return(true);
+   }
+   return(false);
+}
+
+//+------------------------------------------------------------------+
+//| Zera todo o estado interno do ciclo (posição, Mola, balde,        |
+//| contagem de níveis) — usado sempre que um ciclo termina de vez    |
+//| (fechamento total) ou está prestes a começar um novo (AbrirGrid). |
+//+------------------------------------------------------------------+
+void LimparEstadoCiclo()
+{
+   g_molaAtiva      = false;
+   g_baldeExiste    = false;
+   g_baldeVolume    = 0;
+   g_baldeTicket    = 0;
+   g_niveisDescarregados = 0;
+   direcao_atual    = 0;
+   niveis_colocados = 0;
+   preco_entrada    = 0;
+   g_totalNiveis    = 0;
+}

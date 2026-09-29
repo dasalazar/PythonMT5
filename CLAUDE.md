@@ -2,45 +2,33 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project
+## Project Overview
 
-Python CLI application for the WINFUT (B3 mini index futures) market, integrated with
-MetaTrader 5. Scope includes trading automation, backtesting/analysis, performance
-reporting, custom indicators, and order execution. The repository is in initial setup;
-no application code exists yet.
+Repository for algorithmic trading development, backtesting, analysis, custom indicators, and automated strategies for the Brazilian market (B3 - WINFUT / Mini-índice), targeting **MetaTrader 5** and **Nelogica Profit**.
 
-There is already a native MQL5 robot in the account, `EA_GradienteLinear.mq5` (magic
-number 198198), implementing a grid/martingale strategy with two custom indicators:
-`TPV_SMA` (volume-price with moving average) and `Puck_Agressao` (aggression balance
-reconstructed from tick flags via `CopyTicksRange`). The exact relationship between this
-Python project and that EA (complementary reporting vs. an alternative execution path) is
-not yet defined — do not assume one without confirming.
+## Directory Structure
 
-## Development environment: Mac → Windows
+- **`bots/`**: Automated trading strategies and expert advisors.
+  - **`bots/mt5/`**: MetaTrader 5 Expert Advisors (MQL5 / Python). Example: `EA_GradienteLinear3.mq5`.
+  - **`bots/profit/`**: Nelogica Profit strategies, scripts, and automation.
+- **`indicators/`**: Custom technical indicators and signals.
+  - **`indicators/mt5/`**: Custom indicators for MetaTrader 5 (e.g. MQL5 `.mq5` or Python calculations).
+  - **`indicators/profit/`**: Custom indicators, coloring rules, and signal scripts for Profit (Nelogica).
 
-Code is written on macOS but **runs in production on Windows**, with the MetaTrader 5
-terminal open and logged into the broker account there.
+## Development Environment: Mac → Windows
 
-This split exists because the official `MetaTrader5` pip package only ships a Windows
-build. `pip install MetaTrader5` fails on macOS/Linux with `No matching distribution
-found` — this is expected and not an environment problem to fix.
+Code is written on macOS but **runs in production on Windows**, with MetaTrader 5 and/or Profit terminals active.
 
-Rules that follow from this:
+This split exists because the official `MetaTrader5` pip package only ships a Windows build (`pip install MetaTrader5` fails on macOS/Linux with `No matching distribution found` — this is expected and not an environment problem to fix).
 
-- Write real production code against the official API: `import MetaTrader5 as mt5`,
-  direct calls such as `initialize`, `login`, `copy_rates_from_pos`, `order_send`, per
-  https://www.mql5.com/en/docs/integration/python_metatrader5. **No mocks, no
-  abstraction layer, no execution stubs** — the code must be exactly what runs on
-  Windows.
-- Never attempt `pip install MetaTrader5` on the Mac.
-- Nothing that imports the `MetaTrader5` module can be run or tested locally on this
-  machine. All execution validation (connection, order sending, real-time data) happens
-  only on Windows.
-- Expected flow: write/adjust on Mac → sync via git → run/validate on Windows → bring
-  fixes back.
+### Development Guidelines
 
-## Market context
+- **Native APIs**: Write real production code against the official APIs (`import MetaTrader5 as mt5`, direct calls such as `initialize`, `login`, `copy_rates_from_pos`, `order_send`, per [MQL5 Python docs](https://www.mql5.com/en/docs/integration/python_metatrader5)). **No mocks, no abstraction layers, no execution stubs** — the code must be exactly what runs on Windows.
+- **No Local MT5 Installs on Mac**: Never attempt `pip install MetaTrader5` on macOS.
+- **Execution & Validation**: Modules importing `MetaTrader5` cannot be executed locally on macOS. Validation occurs on Windows:
+  - *Workflow*: Write/adjust on macOS → sync via git → run/test on Windows → push fixes back.
 
-- Instrument: B3 mini index futures (WINFUT). The continuous symbol `WIN$` is not
-  tradable — only the specific contract of the current expiration is (e.g. `WINV26`).
-  Never hardcode `WIN$` as an order symbol.
+## Market Context (B3)
+
+- **Instrument**: B3 mini index futures (WINFUT).
+- **Symbol Expiration**: Continuous symbol `WIN$` is not tradable — only the active contract of the current expiration is tradable (e.g. `WINV26`, `WINZ26`, etc.). Never hardcode `WIN$` as an order symbol.
