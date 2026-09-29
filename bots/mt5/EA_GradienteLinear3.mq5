@@ -873,12 +873,12 @@ void OnTick()
    {
       if(!g_molaAtiva && molaAtivaCompra)
       {
-         Print("Sinal de MOLA COMPRA (ativa): TPV_caindo=", TPV_caindo, " compra_caindo=", compra_caindo, " venda_subindo=", venda_subindo);
+         Print("Sinal de MOLA COMPRA (ativa): TPV_vermelho=", TPV_vermelho, " compra_caindo=", compra_caindo, " venda_subindo=", venda_subindo);
          AtivarMola();
       }
       else if(g_molaAtiva && molaDesativaCompra)
       {
-         Print("Sinal de MOLA COMPRA (desativa): TPV_subindo=", TPV_subindo, " compra_subindo=", compra_subindo, " venda_caindo=", venda_caindo);
+         Print("Sinal de MOLA COMPRA (desativa): TPV_verde=", TPV_verde, " compra_subindo=", compra_subindo, " venda_caindo=", venda_caindo);
          DesativarMolaSemFechar();
       }
    }
@@ -886,12 +886,12 @@ void OnTick()
    {
       if(!g_molaAtiva && molaAtivaVenda)
       {
-         Print("Sinal de MOLA VENDA (ativa): TPV_subindo=", TPV_subindo, " venda_caindo=", venda_caindo, " compra_subindo=", compra_subindo);
+         Print("Sinal de MOLA VENDA (ativa): TPV_verde=", TPV_verde, " venda_caindo=", venda_caindo, " compra_subindo=", compra_subindo);
          AtivarMola();
       }
       else if(g_molaAtiva && molaDesativaVenda)
       {
-         Print("Sinal de MOLA VENDA (desativa): TPV_caindo=", TPV_caindo, " venda_subindo=", venda_subindo, " compra_caindo=", compra_caindo);
+         Print("Sinal de MOLA VENDA (desativa): TPV_vermelho=", TPV_vermelho, " venda_subindo=", venda_subindo, " compra_caindo=", compra_caindo);
          DesativarMolaSemFechar();
       }
    }
