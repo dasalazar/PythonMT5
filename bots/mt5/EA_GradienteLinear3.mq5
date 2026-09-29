@@ -812,6 +812,11 @@ void OnTick()
    bool TPV_subindo         = (tpvSubindoArr[0] == 1.0); // TPV subindo
    bool TPV_caindo          = !TPV_subindo;              // TPV caindo
 
+   // Só confia na leitura da barra 1 quando os dois indicadores já terminaram de calcular todas as barras
+   // (no primeiro tick de uma barra nova o EA pode rodar antes do OnCalculate dos indicadores terminar).
+   int  barrasTotal         = Bars(_Symbol, PERIOD_CURRENT);
+   bool indicadoresProntos  = (BarsCalculated(handlePuck) >= barrasTotal && BarsCalculated(handleTPV) >= barrasTotal);
+
    // Entrada / Reentrada:
    //  - Compra: Puck Verde Escuro + TPV Subindo
    //  - Venda:  Puck Vermelho + TPV Caindo
@@ -839,15 +844,21 @@ void OnTick()
       direcao_atual    = 0;
       niveis_colocados = 0;
 
-      // Diagnóstico: uma linha por barra nova enquanto zerado, com os valores brutos lidos (barra 1).
-      static datetime ultimaBarraDiag = 0;
-      datetime barraAtual = iTime(_Symbol, PERIOD_CURRENT, 0);
-      if(barraAtual != ultimaBarraDiag)
+      // Indicadores ainda recalculando a barra que acabou de fechar: a leitura da barra 1 pode estar
+      // defasada (o gráfico já mostra o valor final, o EA ainda não). Não decide entrada nesse tick.
+      if(!indicadoresProntos)
+         return;
+
+      // Diagnóstico: uma linha sempre que a leitura (barra 1) mudar enquanto zerado.
+      static double diagC = -1, diagV = -1, diagT = -1;
+      if(puckSinalCArr[0] != diagC || puckSinalVArr[0] != diagV || tpvSubindoArr[0] != diagT)
       {
-         ultimaBarraDiag = barraAtual;
-         Print("Zerado - leitura barra 1: SinalC=", DoubleToString(puckSinalCArr[0], 1),
-               " SinalV=", DoubleToString(puckSinalVArr[0], 1),
-               " TPVSubindo=", DoubleToString(tpvSubindoArr[0], 1),
+         diagC = puckSinalCArr[0];
+         diagV = puckSinalVArr[0];
+         diagT = tpvSubindoArr[0];
+         Print("Zerado - leitura barra 1: SinalC=", DoubleToString(diagC, 1),
+               " SinalV=", DoubleToString(diagV, 1),
+               " TPVSubindo=", DoubleToString(diagT, 1),
                " | sinalCompra=", sinalCompra, " sinalVenda=", sinalVenda);
       }
 
@@ -881,7 +892,13 @@ void OnTick()
       return;
    }
 
-   // Stop não disparou. Verifica transições da Mola.
+   // Stop não disparou. Verifica transições da Mola (só com indicadores prontos).
+   if(!indicadoresProntos)
+   {
+      AtualizarBalde();
+      return;
+   }
+
    if(tipoPos == POSITION_TYPE_BUY)
    {
       if(!g_molaAtiva && molaAtivaCompra)

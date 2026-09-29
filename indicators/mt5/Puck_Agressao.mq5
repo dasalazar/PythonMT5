@@ -59,8 +59,8 @@ bool   CompraTeveQueda[];
 bool   VendaJaSubiu[];
 bool   VendaTeveQueda[];
 
-datetime g_ultimoTickProcessado = 0;
 bool     g_historicoCarregado   = false;
+datetime g_barraTentativaHistorico = 0; // barra em que a última tentativa de reconstruir o histórico falhou (retenta 1x por barra)
 
 int OnInit()
 {
@@ -96,9 +96,9 @@ int OnInit()
 //+------------------------------------------------------------------+
 //| Classifica um bloco de ticks nas barras correspondentes           |
 //+------------------------------------------------------------------+
-void ClassificarTicks(MqlTick &ticks[], int total, const datetime &time[], int rates_total)
+void ClassificarTicks(MqlTick &ticks[], int total, const datetime &time[], int rates_total, int barraInicial)
 {
-   int barIdx = 0;
+   int barIdx = barraInicial;
    for(int t = 0; t < total; t++)
    {
       datetime tt = ticks[t].time;
@@ -144,8 +144,11 @@ int OnCalculate(const int rates_total,
    // Força a direção dos arrays, para não depender do comportamento padrão
    ArraySetAsSeries(time, false);
 
-   // --- Redimensiona arrays auxiliares preservando dados já calculados ---
-   if(ArraySize(AgressionVolBuy) != rates_total)
+   int prevCalc = prev_calculated;
+
+   // --- Redimensiona arrays auxiliares zerando as posições novas (ArrayResize não inicializa) ---
+   int tamAnterior = ArraySize(AgressionVolBuy);
+   if(tamAnterior != rates_total)
    {
       ArrayResize(AgressionVolBuy, rates_total);
       ArrayResize(AgressionVolSell, rates_total);
@@ -153,69 +156,105 @@ int OnCalculate(const int rates_total,
       ArrayResize(CompraTeveQueda, rates_total);
       ArrayResize(VendaJaSubiu, rates_total);
       ArrayResize(VendaTeveQueda, rates_total);
+
+      for(int k = tamAnterior; k < rates_total; k++)
+      {
+         AgressionVolBuy[k]  = 0.0;
+         AgressionVolSell[k] = 0.0;
+         CompraJaSubiu[k]    = false;
+         CompraTeveQueda[k]  = false;
+         VendaJaSubiu[k]     = false;
+         VendaTeveQueda[k]   = false;
+      }
    }
 
-   // --- Inicialização (uma única vez): reconstrói histórico ou não, conforme o parâmetro ---
+   // Recálculo total pedido pelo terminal (troca de período, histórico atualizado...): refaz o histórico também.
+   if(prev_calculated == 0)
+      g_historicoCarregado = false;
+
+   // --- Histórico: reconstrói (ou não) conforme o parâmetro. Se a reconstrução falhar, retenta 1x por barra. ---
+   bool reconstruiu = false;
+   datetime barraAtual = time[rates_total - 1];
+
    if(!g_historicoCarregado)
    {
-      ArrayInitialize(AgressionVolBuy, 0.0);
-      ArrayInitialize(AgressionVolSell, 0.0);
-      ArrayInitialize(CompraJaSubiu, false);
-      ArrayInitialize(CompraTeveQueda, false);
-      ArrayInitialize(VendaJaSubiu, false);
-      ArrayInitialize(VendaTeveQueda, false);
-
       if(ReconstruirHistorico)
       {
-         datetime inicio = TimeCurrent() - DiasHistoricoTicks * 86400;
-         MqlTick ticks[];
-         int copiados = 0;
-
-         // Na primeira chamada, o terminal pode ainda não ter sincronizado o
-         // histórico de tick localmente (comportamento documentado do MQL5) —
-         // por isso tenta até 3 vezes, com uma pequena pausa entre elas, antes
-         // de desistir e seguir só em tempo real.
-         for(int tentativa = 1; tentativa <= 3; tentativa++)
+         if(g_barraTentativaHistorico != barraAtual)
          {
-            copiados = CopyTicksRange(_Symbol, ticks, COPY_TICKS_TRADE, (ulong)inicio * 1000, (ulong)TimeCurrent() * 1000);
+            g_barraTentativaHistorico = barraAtual;
+
+            datetime inicio = TimeCurrent() - DiasHistoricoTicks * 86400;
+            MqlTick ticks[];
+            int copiados = 0;
+
+            // Na primeira chamada, o terminal pode ainda não ter sincronizado o
+            // histórico de tick localmente (comportamento documentado do MQL5) —
+            // por isso tenta até 3 vezes, com uma pequena pausa entre elas.
+            for(int tentativa = 1; tentativa <= 3; tentativa++)
+            {
+               copiados = CopyTicksRange(_Symbol, ticks, COPY_TICKS_TRADE, (ulong)inicio * 1000, 0);
+
+               if(copiados > 0)
+                  break;
+
+               Print("PuckAgressao: tentativa ", tentativa, "/3 de reconstruir histórico não retornou ticks (terminal pode ainda estar sincronizando). Tentando novamente...");
+               Sleep(300);
+            }
 
             if(copiados > 0)
-               break;
+            {
+               ArrayInitialize(AgressionVolBuy, 0.0);
+               ArrayInitialize(AgressionVolSell, 0.0);
+               ArrayInitialize(CompraJaSubiu, false);
+               ArrayInitialize(CompraTeveQueda, false);
+               ArrayInitialize(VendaJaSubiu, false);
+               ArrayInitialize(VendaTeveQueda, false);
 
-            Print("PuckAgressao: tentativa ", tentativa, "/3 de reconstruir histórico não retornou ticks (terminal pode ainda estar sincronizando). Tentando novamente...");
-            Sleep(300);
+               ClassificarTicks(ticks, copiados, time, rates_total, 0);
+               g_historicoCarregado = true;
+               reconstruiu          = true;
+               prevCalc             = 0;
+            }
+            else
+               Print("PuckAgressao: nenhum tick histórico retornado após 3 tentativas. Seguindo só com os ticks das últimas barras; nova tentativa na próxima barra.");
          }
-
-         if(copiados > 0)
-            ClassificarTicks(ticks, copiados, time, rates_total);
-         else
-            Print("PuckAgressao: nenhum tick histórico retornado após 3 tentativas. Seguindo só em tempo real a partir de agora (aquecimento de ~", PeriodoPuckAgressao, " barras).");
       }
       else
       {
          Print("PuckAgressao: iniciado em modo tempo real (ReconstruirHistorico=false). Barras anteriores a agora ficam sem valor de agressão.");
+         g_historicoCarregado = true;
+      }
+   }
+
+   // --- Atualização das barras recentes: ZERA e RECONTA a partir dos ticks (idempotente).
+   //     Não acumula por chamada: o resultado não depende de quantas vezes o OnCalculate rodou,
+   //     então o gráfico e o EA (instâncias separadas) chegam exatamente aos mesmos valores. ---
+   if(!reconstruiu)
+   {
+      int recalcDe = rates_total - 2;
+      if(prevCalc > 0)
+         recalcDe = MathMin(prevCalc - 1, rates_total - 2);
+
+      for(int k = recalcDe; k < rates_total; k++)
+      {
+         AgressionVolBuy[k]  = 0.0;
+         AgressionVolSell[k] = 0.0;
       }
 
-      g_ultimoTickProcessado = TimeCurrent();
-      g_historicoCarregado   = true;
-   }
-   else
-   {
-      // --- Atualização incremental: só os ticks novos desde a última chamada (igual nos dois modos) ---
       MqlTick ticksNovos[];
-      int copiados = CopyTicksRange(_Symbol, ticksNovos, COPY_TICKS_TRADE, (ulong)g_ultimoTickProcessado * 1000, (ulong)TimeCurrent() * 1000 + 1000);
+      int copiados = CopyTicksRange(_Symbol, ticksNovos, COPY_TICKS_TRADE, (ulong)time[recalcDe] * 1000, 0);
 
       if(copiados > 0)
-         ClassificarTicks(ticksNovos, copiados, time, rates_total);
-
-      g_ultimoTickProcessado = TimeCurrent();
+         ClassificarTicks(ticksNovos, copiados, time, rates_total, recalcDe);
    }
 
    // --- Delta, soma móvel, cmfReal, agress_pos/neg e médias exponenciais ---
-   int start = (prev_calculated == 0) ? PeriodoPuckAgressao - 1 : MathMax(prev_calculated - 1, PeriodoPuckAgressao - 1);
+   // Sempre recalcula também a barra 1 (a que o EA lê), pois o volume dela foi recontado acima.
+   int start = (prevCalc == 0) ? PeriodoPuckAgressao - 1 : MathMax(MathMin(prevCalc - 1, rates_total - 2), PeriodoPuckAgressao - 1);
    double alpha = 2.0 / (PeriodoPuckAgressao + 1.0);
 
-   if(prev_calculated == 0)
+   if(prevCalc == 0)
    {
       for(int k = 0; k < PeriodoPuckAgressao - 1; k++)
       {
@@ -249,7 +288,7 @@ int OnCalculate(const int rates_total,
       double agress_pos = (cmfReal > 0) ? MathAbs(cmfReal) : 0.0;
       double agress_neg = (cmfReal < 0) ? MathAbs(cmfReal) : 0.0;
 
-      if(i == 0 || (i == PeriodoPuckAgressao - 1 && prev_calculated == 0))
+      if(i == 0 || (i == PeriodoPuckAgressao - 1 && prevCalc == 0))
       {
          // semente da média exponencial: primeiro valor calculado da janela
          MediaPosBuffer[i] = agress_pos;
