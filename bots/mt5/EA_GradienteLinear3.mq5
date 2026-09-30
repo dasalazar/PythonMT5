@@ -82,6 +82,8 @@
 #include <Trade\Trade.mqh>
 CTrade trade;
 
+#define COMENTARIO_BALDE "BALDE"
+
 //+------------------------------------------------------------------+
 //| Normaliza um preço calculado (soma/subtração/multiplicação) pra a |
 //| grade de tick real do símbolo. Necessário porque médias e contas  |
@@ -281,28 +283,31 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
       bool ehCompra = (tipoDeal == DEAL_TYPE_BUY);
 
-      if(g_baldeExiste || g_molaAtiva)
+      if(g_molaAtiva)
       {
-         // Determina o nível do grid com base na distância de preço da entrada
+         // Mola ligada: a pendente foi colocada com a quantidade da tabela do nível,
+         // então divide o preenchimento entre OCO individual e balde conforme a tabela.
          int nivel = (DistanciaGrid > 0 && preco_entrada > 0) ? (int)MathRound(MathAbs(preco_entrada - precoDeal) / DistanciaGrid) : 0;
 
          double totalL = volumeDeal, ocoL = volumeDeal, baldeL = 0;
          if(nivel >= 1)
             ObterLotesPorNivel(nivel, totalL, ocoL, baldeL);
 
-         // Lança OCO individual apenas para a cota de OCO deste nível (se > 0)
-         if(ocoL > 0)
-         {
-            ColocarSaidaOCO(ehCompra, precoDeal, ocoL);
-         }
+         if(ocoL > volumeDeal)
+            ocoL = volumeDeal; // nunca coloca OCO maior que o que realmente preencheu
 
-         // Atualiza o balde consolidado cobrindo o restante
+         if(ocoL > 0)
+            ColocarSaidaOCO(ehCompra, precoDeal, ocoL);
+
          AtualizarBalde();
       }
-      else if(tipoDeal == DEAL_TYPE_BUY)
-         ColocarSaidaOCO(true, precoDeal, volumeDeal);
-      else if(tipoDeal == DEAL_TYPE_SELL)
-         ColocarSaidaOCO(false, precoDeal, volumeDeal);
+      else
+      {
+         // Mola desligada (com ou sem balde já existente): o preenchimento inteiro ganha
+         // a sua OCO no preço original. O teto (checado dentro de ColocarSaidaOCO) é o
+         // único motivo pra parte dela ir pro balde.
+         ColocarSaidaOCO(ehCompra, precoDeal, volumeDeal);
+      }
 
       return;
    }
@@ -311,7 +316,13 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    {
       ulong ordemOrigem = (ulong)HistoryDealGetInteger(trans.deal, DEAL_ORDER);
 
-      if(g_baldeExiste && ordemOrigem == g_baldeTicket)
+      // O ticket guardado pode já ter sido zerado pelo AtualizarBalde (ordem já FILLED no book
+      // antes deste evento chegar) — por isso confere também o comentário gravado na ordem.
+      bool foiBalde = (g_baldeTicket != 0 && ordemOrigem == g_baldeTicket);
+      if(!foiBalde && HistoryOrderSelect(ordemOrigem))
+         foiBalde = (HistoryOrderGetString(ordemOrigem, ORDER_COMMENT) == COMENTARIO_BALDE);
+
+      if(foiBalde)
       {
          // Foi o balde que preencheu (total ou parcialmente).
          g_baldeVolume -= volumeDeal;
@@ -504,6 +515,101 @@ void CancelarOrdensPorTipo(ENUM_ORDER_TYPE tipo, ulong ticketExcluir = 0)
 }
 
 //+------------------------------------------------------------------+
+//| Cancela SÓ o excedente de OCOs individuais (as mais distantes do   |
+//| preço médio primeiro) até a soma voltar a caber no volume da       |
+//| posição. As demais continuam intactas no preço em que foram criadas.|
+//+------------------------------------------------------------------+
+void CancelarExcessoIndividual(ENUM_ORDER_TYPE tipo, double volumePosicao, bool ehCompra)
+{
+   for(int rodada = 0; rodada < 100; rodada++)
+   {
+      if(SomarVolumeIndividualPendente(tipo) <= volumePosicao + 0.0000001)
+         return;
+
+      ulong  ticketAlvo = 0;
+      double precoAlvo  = 0;
+
+      for(int i = OrdersTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = OrderGetTicket(i);
+         if(ticket == 0) continue;
+         if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+         if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+         if((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) != tipo) continue;
+         if(g_baldeTicket != 0 && ticket == g_baldeTicket) continue;
+         if((ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE) != ORDER_STATE_PLACED) continue;
+
+         double preco = OrderGetDouble(ORDER_PRICE_OPEN);
+         bool maisDistante = (ticketAlvo == 0) || (ehCompra ? (preco > precoAlvo) : (preco < precoAlvo));
+         if(maisDistante)
+         {
+            ticketAlvo = ticket;
+            precoAlvo  = preco;
+         }
+      }
+
+      if(ticketAlvo == 0 || !trade.OrderDelete(ticketAlvo))
+         return;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| A Mola só muda a QUANTIDADE das pendentes de entrada ainda não    |
+//| executadas: cada uma é recolocada no MESMO preço, com a quantidade |
+//| do nível (tabela se ligada, QuantidadePorOrdem se desligada). Não  |
+//| depende de contagem de níveis — trabalha sobre as pendentes que    |
+//| realmente existem no book (inclui níveis recarregados por OCO).    |
+//| Saídas (OCO/balde) não são tocadas aqui.                           |
+//+------------------------------------------------------------------+
+void AjustarQuantidadeEntradasPendentes(bool molaLigada)
+{
+   bool ehCompra = (direcao_atual == 1);
+   ENUM_ORDER_TYPE tipoEntrada = ehCompra ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
+
+   ulong  tickets[];
+   double precos[];
+   double volumes[];
+   int    n = 0;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+      if((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) != tipoEntrada) continue;
+      if((ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE) != ORDER_STATE_PLACED) continue;
+
+      ArrayResize(tickets, n + 1);
+      ArrayResize(precos,  n + 1);
+      ArrayResize(volumes, n + 1);
+      tickets[n] = ticket;
+      precos[n]  = OrderGetDouble(ORDER_PRICE_OPEN);
+      volumes[n] = OrderGetDouble(ORDER_VOLUME_CURRENT);
+      n++;
+   }
+
+   for(int k = 0; k < n; k++)
+   {
+      int nivel = (DistanciaGrid > 0 && preco_entrada > 0) ? (int)MathRound(MathAbs(preco_entrada - precos[k]) / DistanciaGrid) : 0;
+      double alvo = molaLigada ? ObterTotalLotePorNivel(nivel) : QuantidadePorOrdem;
+
+      if(MathAbs(alvo - volumes[k]) < 0.0000001)
+         continue; // já está na quantidade certa
+
+      if(!trade.OrderDelete(tickets[k]))
+      {
+         Print("Mola: falha ao cancelar entrada pendente #", tickets[k], " (nivel ", nivel, "): ", trade.ResultRetcodeDescription());
+         continue;
+      }
+
+      bool ok = ehCompra ? trade.BuyLimit(alvo, precos[k], _Symbol) : trade.SellLimit(alvo, precos[k], _Symbol);
+      if(!ok)
+         Print("Mola: falha ao recolocar nivel ", nivel, " com ", alvo, " contratos em ", DoubleToString(precos[k], _Digits), ": ", trade.ResultRetcodeDescription());
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Ativa a Mola: varre as OCOs individuais existentes (preenchimentos|
 //| feitos com a Mola desligada) e soma o volume delas ao balde — sem |
 //| recriar um balde novo, se um já existir de um ciclo anterior de   |
@@ -516,25 +622,14 @@ void AtivarMola()
 
    CarregarProgressaoMola();
 
-   bool ehCompra = (direcao_atual == 1);
-   ENUM_ORDER_TYPE tipoEntradaPendente = ehCompra ? ORDER_TYPE_BUY_LIMIT  : ORDER_TYPE_SELL_LIMIT;
-
-   // Mantém todas as ordens OCO individuais ativas no preço original (a menos que ultrapassem o teto).
-   // O AtualizarBalde() cuida de migrar apenas as ordens que ultrapassarem o teto e dimensionar o balde.
+   // AtualizarBalde() só migra pro balde as OCOs que ultrapassam o teto; as demais ficam
+   // no preço original. Também define direcao_atual a partir da posição real.
    AtualizarBalde();
 
-   // A Mola altera apenas a quantidade de contratos das ordens pendentes de entrada ainda não executadas
-   CancelarOrdensPorTipo(tipoEntradaPendente);
-   int niveisPreenchidosGrid = g_totalNiveis - 1; // exclui a entrada a mercado (nível 0)
-   for(int nivel = niveisPreenchidosGrid + 1; nivel <= NiveisGradiente; nivel++)
-   {
-      double loteNivel = ObterTotalLotePorNivel(nivel);
-      double nivelPreco = NormalizarPreco(ehCompra ? (preco_entrada - nivel * DistanciaGrid) : (preco_entrada + nivel * DistanciaGrid));
-      bool ok = ehCompra ? trade.BuyLimit(loteNivel, nivelPreco, _Symbol) : trade.SellLimit(loteNivel, nivelPreco, _Symbol);
+   bool ehCompra = (direcao_atual == 1);
 
-      if(!ok)
-         Print("Mola: falha ao colocar nivel ", nivel, " com ", loteNivel, " contratos em ", DoubleToString(nivelPreco, _Digits), ": ", trade.ResultRetcodeDescription());
-   }
+   // A Mola altera APENAS a quantidade das pendentes de entrada ainda não executadas.
+   AjustarQuantidadeEntradasPendentes(true);
 
    Print("MOLA ATIVADA (", (ehCompra ? "compra" : "venda"), "). Pendentes de entrada ajustadas por nivel. Balde: volume=", g_baldeVolume);
 }
@@ -616,8 +711,8 @@ void AtualizarBalde()
    if(volumeIndividual > volumePosicao)
    {
       Print("!!! ALERTA DE SEGURANÇA: Volume de saidas individuais (", volumeIndividual,
-            ") > volume da posicao (", volumePosicao, "). Cancelando ordens excedentes.");
-      CancelarOrdensPorTipo(tipoSaida, g_baldeTicket);
+            ") > volume da posicao (", volumePosicao, "). Cancelando só o excedente (as mais distantes).");
+      CancelarExcessoIndividual(tipoSaida, volumePosicao, ehCompra);
       volumeIndividual = SomarVolumeIndividualPendente(tipoSaida);
    }
 
@@ -700,7 +795,8 @@ void AtualizarBalde()
    bool ok = false;
    for(int tentativa = 1; tentativa <= 3 && !ok; tentativa++)
    {
-      ok = ehCompra ? trade.SellLimit(novoVolumeBalde, precoSaida, _Symbol) : trade.BuyLimit(novoVolumeBalde, precoSaida, _Symbol);
+      ok = ehCompra ? trade.SellLimit(novoVolumeBalde, precoSaida, _Symbol, 0, 0, ORDER_TIME_GTC, 0, COMENTARIO_BALDE)
+                    : trade.BuyLimit(novoVolumeBalde, precoSaida, _Symbol, 0, 0, ORDER_TIME_GTC, 0, COMENTARIO_BALDE);
 
       if(!ok)
       {
@@ -733,20 +829,8 @@ void AtualizarBalde()
 //+------------------------------------------------------------------+
 void DesativarMolaSemFechar()
 {
-   bool ehCompra = (direcao_atual == 1);
-   ENUM_ORDER_TYPE tipoEntradaPendente = ehCompra ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
-
-   CancelarOrdensPorTipo(tipoEntradaPendente);
-
-   int niveisPreenchidosGrid = g_totalNiveis - 1;
-   for(int nivel = niveisPreenchidosGrid + 1; nivel <= NiveisGradiente; nivel++)
-   {
-      double nivelPreco = NormalizarPreco(ehCompra ? (preco_entrada - nivel * DistanciaGrid) : (preco_entrada + nivel * DistanciaGrid));
-      bool ok = ehCompra ? trade.BuyLimit(QuantidadePorOrdem, nivelPreco, _Symbol) : trade.SellLimit(QuantidadePorOrdem, nivelPreco, _Symbol);
-
-      if(!ok)
-         Print("Desativar Mola: falha ao reverter nivel ", nivel, " em ", DoubleToString(nivelPreco, _Digits), ": ", trade.ResultRetcodeDescription());
-   }
+   // Volta a quantidade das pendentes de entrada ainda não executadas pro padrão (1x).
+   AjustarQuantidadeEntradasPendentes(false);
 
    g_molaAtiva = false;
    Print("MOLA DESATIVADA. Pendentes voltaram pra ", QuantidadePorOrdem, " contrato(s). Balde MANTIDO (volume=", g_baldeVolume, "), sem cancelar.");
