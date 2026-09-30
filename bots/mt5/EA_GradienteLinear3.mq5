@@ -1,83 +1,81 @@
 //+------------------------------------------------------------------+
 //|                                     EA_GradienteLinear3.mq5      |
-//| Robô de grid (Gradiente Linear) — v3, ponto de partida idêntico  |
-//| ao EA_GradienteLinear2.mq5 (v2), que continua intocado e rodando |
-//| como está. Este arquivo é onde as próximas evoluções entram.     |
+//| Robô de grid (Gradiente Linear) — v3. Parte do EA_GradienteLinear2|
+//| (v2, intocado e rodando como está); as evoluções entram aqui.     |
 //|                                                                    |
-//| Entrada: automática, combinando os indicadores Puck_Agressao e    |
-//| TPV (a trava extra contra entrada+stop simultâneo já incluída).   |
-//| "Não posicionado" é garantido estruturalmente (só entra dentro do |
-//| bloco !PositionSelect), não precisa ser uma condição explícita.   |
-//| O TPV entra pela dimensão Subindo/Caindo, não Comprado/Vendido:   |
-//|   Sinal Compra = compra_subindo E NÃO venda_subindo E TPV_subindo |
-//|   Sinal Venda  = venda_subindo  E NÃO compra_subindo E TPV_caindo |
+//| ENTRADA / REENTRADA (só sem posição aberta, lendo a barra 1        |
+//| fechada dos indicadores, e só quando eles já terminaram de calcular):|
+//|   Compra: Puck_Agressao verde escuro (SinalC = 1.0) E TPV subindo  |
+//|   Venda:  Puck_Agressao vermelho     (SinalV = 1.0) E TPV caindo   |
+//| "Não posicionado" é garantido estruturalmente (só entra dentro do  |
+//| bloco !PositionSelect). Sem posição, sobra de ordem pendente é     |
+//| cancelada antes de avaliar a entrada. Se a posição fechar no meio  |
+//| da barra e o sinal da barra 1 continuar valendo, reentra na hora.  |
 //|                                                                    |
-//| Mecanismo MOLA: estado defensivo intermediário, entre "sinal      |
-//| ainda ok" e o stop de verdade — cobre o caso de estar posicionado |
-//| e o TPV começar a desfavorecer a posição, sem que o stop tenha    |
-//| disparado ainda. Depende só da dimensão TPV_subindo/TPV_caindo    |
-//| (independente do Puck_Agressao):                                  |
-//|   Ativa (comprado): TPV_caindo  | Desativa: TPV_subindo           |
-//|   Ativa (vendido):  TPV_subindo | Desativa: TPV_caindo            |
-//| Como as duas são opostas exatas, é um estado que reflete o valor  |
-//| atual a cada tick, não um evento de borda único.                  |
+//| GRID: ao entrar, coloca NiveisGradiente pendentes de entrada, uma a|
+//| cada DistanciaGrid do preço de entrada, com QuantidadePorOrdem. Sem|
+//| stop de preço: se o preço não recuperar nenhum nível, a posição    |
+//| fica exposta até o limite do grid.                                 |
 //|                                                                    |
-//| Ligada: pendentes de entrada que faltam mantêm o MESMO espaçamento|
-//| (DistanciaGrid), só a QUANTIDADE dobra (2x QuantidadePorOrdem).   |
-//| Cada preenchimento de um nível dobrado divide ao meio: metade vai |
-//| pra uma OCO individual normal (DistanciaGridSaida); a outra       |
-//| metade entra no "balde" — uma saída consolidada, sempre reposta   |
-//| no preço médio ATUAL da posição ± MolaPontos, com o volume         |
-//| acumulado. Se a metade individual de um nível dobrado bate o      |
-//| alvo dela, recarrega aquele nível — de novo em 2x, se a Mola      |
-//| ainda estiver ligada nesse momento.                                |
-//|                                                                    |
-//| O BALDE PERSISTE o ciclo inteiro — nunca é cancelado só por a      |
-//| Mola desligar. Ao desligar, só a quantidade das pendentes volta   |
-//| pra 1x; o balde fica parado, exatamente como está, esperando ser  |
-//| preenchido ou ser retomado numa próxima ativação (ligar de novo   |
-//| não cria um balde novo — soma ao que já existe).                  |
-//| Preenchimentos feitos com a Mola desligada usam OCO individual     |
-//| normal; ao religar, essas OCOs são varridas e somadas ao balde.   |
-//| Se o balde preencher (total ou parcial), reduz o volume dele; se   |
-//| a posição zerar por causa dele, encerra o ciclo inteiro.           |
+//| SAÍDA POR OCO INDIVIDUAL: cada unidade preenchida (entrada a       |
+//| mercado ou nível de grid) ganha sua própria ordem limit de saída,  |
+//| DistanciaGridSaida pontos a partir do preço REAL do preenchimento. |
+//| Essa OCO é mantida no preço em que foi criada, sempre. A única     |
+//| exceção é o TETO (abaixo). Quando uma OCO individual é executada,  |
+//| o nível dela é recarregado (nova pendente de entrada no mesmo      |
+//| preço); se era a última unidade, o ciclo encerra e as pendentes    |
+//| restantes são canceladas.                                          |
 //|                                                                    |
 //| TETO UNIVERSAL: nenhuma OCO individual pode ter alvo além de       |
-//| preço_médio ± MolaPontos, não importa se a Mola está ligada ou    |
-//| desligada no momento — se ultrapassaria, o volume vai direto pro  |
-//| balde. Checado na criação (ColocarSaidaOCO) e continuamente        |
-//| (MigrarOrdensAlemDoTeto, rodando toda vez que o balde recalcula), |
-//| pra pegar também ordens que ficaram obsoletas com o tempo.         |
+//| preço_médio ± MolaPontos, com a Mola ligada ou não. Só as ordens   |
+//| que ultrapassam o teto saem do preço original e vão pro balde.     |
+//| Checado na criação (ColocarSaidaOCO) e continuamente               |
+//| (MigrarOrdensAlemDoTeto, a cada recálculo do balde), pois o preço  |
+//| médio se move depois que a OCO já existe.                          |
 //|                                                                    |
-//| DESCARGA DO BALDE: DESATIVADA nesta versão. A tentativa de        |
-//| descarregar unidades no limiar contra colocava ordens de saída     |
-//| abaixo do preço médio (no prejuízo), causando perdas reais no grid.|
-//| No Gradiente Linear, o fechamento só ocorre no lucro (alvo do      |
-//| balde / OCO) ou no Stop Financeiro global da posição.              |
+//| BALDE: saída consolidada única, sempre reposta no preço médio      |
+//| ATUAL ± MolaPontos, com volume = volume da posição menos o volume  |
+//| das OCOs individuais pendentes (a soma das saídas é sempre igual   |
+//| à posição). Fica identificado pelo comentário "BALDE" da ordem.    |
+//| Persiste o ciclo inteiro: nunca é cancelado só porque a Mola       |
+//| desligou. Se preencher (total ou parcial), reduz o volume dele; se |
+//| a posição zerar por causa dele, encerra o ciclo.                   |
 //|                                                                    |
-//| Saída híbrida (fora da Mola):                                     |
-//|  1) OCO por nível: cada unidade preenchida (entrada a mercado ou  |
-//|     nível de grid) ganha sua própria ordem de saída (limit),      |
-//|     DistanciaGridSaida pontos de lucro a partir do preço real     |
-//|     daquele preenchimento — igual ao OCO do NTSL original.        |
-//|  2) Stop FINANCEIRO — não depende mais de indicador nenhum. Fecha |
-//|     a posição inteira quando a perda flutuante (lucro + swap)     |
-//|     atinge -StopFinanceiro (padrão R$ 5.000,00). Tem prioridade   |
-//|     sobre a Mola, fecha tudo independente do estado. Cancela      |
-//|     TODAS as ordens pendentes restantes (níveis de grid não       |
-//|     preenchidos + saídas OCO/consolidada ainda não preenchidas).  |
+//| MOLA: estado defensivo entre "sinal ainda ok" e o stop, para a     |
+//| posição em que o TPV/Puck passam a desfavorecer. Reflete o valor   |
+//| atual a cada tick (não é evento de borda único); ativa e desativa  |
+//| são exatamente opostas, para não oscilar:                          |
+//|   Comprado: ativa se TPV caindo OU (Puck compra branco E Puck venda|
+//|             colorido); desativa caso contrário.                    |
+//|   Vendido:  ativa se TPV subindo OU (Puck venda branco E Puck      |
+//|             compra colorido); desativa caso contrário.             |
+//| O QUE A MOLA FAZ: altera SOMENTE a quantidade das pendentes de     |
+//| entrada ainda não executadas, no mesmo preço e espaçamento.        |
+//|   Ligada:    cada nível usa MolaProgressaoLotes (lotes totais).    |
+//|   Desligada: volta a QuantidadePorOrdem.                           |
+//| Ao preencher um nível com a Mola ligada, MolaProgressaoOCO define  |
+//| quantos lotes vão pra OCO individual; o restante da posição fica   |
+//| coberto pelo balde. Com a Mola desligada, o preenchimento inteiro  |
+//| ganha OCO individual (o teto decide se parte dela vai pro balde).  |
+//| A Mola não cancela, move nem recria OCOs individuais ou o balde.   |
 //|                                                                    |
-//| Grid: réplica da config atual (NiveisGradiente=50, sem stop de    |
-//|       preço) — se o sinal não reverter e o preço não recuperar    |
-//|       nenhum nível, a posição fica exposta até o limite do grid.  |
+//| DESCARGA DO BALDE: DESATIVADA. Descarregar no limiar contra        |
+//| colocava saídas abaixo do preço médio (no prejuízo). No Gradiente  |
+//| Linear, o fechamento só ocorre no lucro (OCO / balde) ou no Stop   |
+//| Financeiro.                                                        |
 //|                                                                    |
-//| Requer Puck_Agressao.mq5 e TPV_SMA.mq5 já compilados em           |
-//| MQL5/Indicators/dsalazar. Assume conta em modo NETTING (padrão    |
-//| para B3) — uma única posição agregada por ativo, não hedging.     |
+//| STOP FINANCEIRO: independe de indicador. Fecha a posição inteira   |
+//| quando a perda flutuante (lucro + swap) atinge -StopFinanceiro.    |
+//| Tem prioridade sobre a Mola e cancela TODAS as pendentes (entradas,|
+//| OCOs e balde).                                                     |
 //|                                                                    |
-//| MagicNumber padrão diferente do v1 (198198) e do v2 (198199) —    |
-//| pra rodar as três versões ao mesmo tempo, no mesmo símbolo, sem   |
-//| uma interferir nas ordens da outra, caso você queira comparar.    |
+//| Requer Puck_Agressao.mq5 e TPV_SMA.mq5 compilados em               |
+//| MQL5/Indicators/dsalazar (mesmos parâmetros do gráfico). Assume    |
+//| conta NETTING (padrão B3): uma posição agregada por ativo.         |
+//|                                                                    |
+//| MagicNumber padrão diferente do v1 (198198) e do v2 (198199), para |
+//| rodar as três versões juntas no mesmo símbolo sem uma interferir   |
+//| nas ordens da outra.                                               |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 CTrade trade;
