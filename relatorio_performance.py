@@ -31,7 +31,12 @@ class PerformanceMetrics:
     qtd_perdedoras: int = 0
     fator_lucro: Optional[float] = None  # None representa "—" (indefinido)
     qtd_ordens: int = 0
+    qtd_contratos: float = 0.0
+    custos_b3: float = 0.0
     corretagem_total: float = 0.0
+    custo_operacional_total: float = 0.0
+    irpf: float = 0.0
+    resultado_liquido: float = 0.0
 
 
 @dataclass
@@ -165,6 +170,8 @@ class MT5PerformanceService:
         data_fim: date,
         ativo_filtro: str = "Todos",
         corretagem_por_ordem: float = 0.11,
+        taxa_b3_por_contrato: float = 0.25,
+        aliquota_irpf: float = 20.0,
     ) -> Tuple[bool, PerformanceMetrics, str]:
         """
         Calcula os indicadores de performance para operações fechadas no período.
@@ -208,6 +215,7 @@ class MT5PerformanceService:
 
         operacoes_resultados: List[float] = []
         total_ordens: int = 0
+        total_contratos: float = 0.0
 
         for pos_id in candidate_position_ids:
             # Se ainda estiver aberta, não entra nos indicadores de fechadas (RN-08)
@@ -238,12 +246,13 @@ class MT5PerformanceService:
             op_profit = sum(float(d.profit) for d in sorted_deals)
             operacoes_resultados.append(op_profit)
             total_ordens += len(sorted_deals)
+            total_contratos += sum(float(d.volume) for d in sorted_deals)
 
         # Calcular métricas
         metrics = PerformanceMetrics()
         metrics.qtd_operacoes = len(operacoes_resultados)
         metrics.qtd_ordens = total_ordens
-        metrics.corretagem_total = total_ordens * corretagem_por_ordem
+        metrics.qtd_contratos = total_contratos
 
         for res in operacoes_resultados:
             if res > 0:
@@ -261,6 +270,18 @@ class MT5PerformanceService:
             metrics.fator_lucro = metrics.lucro_bruto / abs(metrics.prejuizo_bruto)
         else:
             metrics.fator_lucro = None
+
+        # Taxas, Emolumentos e IRPF
+        metrics.custos_b3 = total_contratos * taxa_b3_por_contrato
+        metrics.corretagem_total = total_ordens * corretagem_por_ordem
+        metrics.custo_operacional_total = metrics.custos_b3 + metrics.corretagem_total
+
+        # IRPF incide sobre o lucro líquido após custos operacionais
+        lucro_tributavel = max(0.0, metrics.resultado_total - metrics.custo_operacional_total)
+        metrics.irpf = lucro_tributavel * (aliquota_irpf / 100.0)
+        metrics.resultado_liquido = (
+            metrics.resultado_total - metrics.custo_operacional_total - metrics.irpf
+        )
 
         return True, metrics, ""
 
@@ -305,7 +326,14 @@ class CLIFormatter:
         print("=" * 70)
 
     @staticmethod
-    def render_menu(data_ini: date, data_fim: date, ativo: str, corretagem: float):
+    def render_menu(
+        data_ini: date,
+        data_fim: date,
+        ativo: str,
+        corretagem: float,
+        taxa_b3: float,
+        aliquota_irpf: float,
+    ):
         CLIFormatter.clear_screen()
         CLIFormatter.render_header("RELATÓRIO DE PERFORMANCE MT5")
         
@@ -316,15 +344,19 @@ class CLIFormatter:
             periodo_str += " (Hoje)"
 
         print("Configuração Atual:")
-        print(f"  • Período:    {periodo_str}")
-        print(f"  • Ativo:      {ativo}")
-        print(f"  • Corretagem: {format_brl(corretagem)} / ordem")
+        print(f"  • Período:        {periodo_str}")
+        print(f"  • Ativo:          {ativo}")
+        print(f"  • Corretagem:     {format_brl(corretagem)} / ordem")
+        print(f"  • Taxa B3:        {format_brl(taxa_b3)} / contrato")
+        print(f"  • Alíquota IRPF:  {aliquota_irpf:g}%")
         print("-" * 70)
         print("Opções:")
         print("  (1) Período")
         print("  (2) Ativo")
         print("  (3) Corretagem por ordem")
-        print("  (4) Iniciar relatório")
+        print("  (4) Taxa B3 por contrato")
+        print("  (5) Alíquota IRPF (%)")
+        print("  (6) Iniciar relatório")
         print("  (0) Sair")
         print("=" * 70)
 
@@ -336,6 +368,9 @@ class CLIFormatter:
         last_update: datetime,
         metrics: Optional[PerformanceMetrics],
         positions: List[PositionInfo],
+        corretagem_por_ordem: float,
+        taxa_b3_por_contrato: float,
+        aliquota_irpf: float,
         error_msg: Optional[str] = None,
     ):
         CLIFormatter.clear_screen()
@@ -357,12 +392,11 @@ class CLIFormatter:
             return
 
         if metrics is not None:
-            # Formatação com preenchimento antes da aplicação de ANSI para não quebrar alinhamento
+            # Formatação de Indicadores
             res_total_str = f"{format_brl(metrics.resultado_total):>15}"
             lucro_bruto_str = f"{format_brl(metrics.lucro_bruto):>15}"
             prejuizo_bruto_str = f"{format_brl(metrics.prejuizo_bruto):>15}"
             qtd_ops_str = f"{metrics.qtd_operacoes:>15}"
-            
             venc_str = f"{metrics.qtd_vencedoras:>15}"
             perd_str = f"{metrics.qtd_perdedoras:>15}"
 
@@ -375,7 +409,6 @@ class CLIFormatter:
             else:
                 fator_lucro_str = f"{'—':>15}"
 
-            # Coloração semântica
             res_total_colorido = colorize_valor(metrics.resultado_total, res_total_str)
             lucro_bruto_colorido = (
                 f"{Colors.GREEN}{lucro_bruto_str}{Colors.RESET}"
@@ -398,17 +431,34 @@ class CLIFormatter:
                 else perd_str
             )
 
-            corretagem_str = format_brl(metrics.corretagem_total)
-            detalhe_ordens = f" (Ordens: {metrics.qtd_ordens} | Corretagem: {corretagem_str})"
-
             print("INDICADORES (OPERAÇÕES FECHADAS):")
             print(f"  Resultado Total:                  {res_total_colorido}")
             print(f"  Lucro Bruto:                      {lucro_bruto_colorido}")
             print(f"  Prejuízo Bruto:                  {prejuizo_bruto_colorido}")
-            print(f"  Quantidade de Operações:          {qtd_ops_str}{detalhe_ordens}")
+            print(f"  Quantidade de Operações:          {qtd_ops_str}")
             print(f"  Operações Vencedoras:             {venc_colorido}")
             print(f"  Operações Perdedoras:             {perd_colorido}")
             print(f"  Fator de Lucro:                   {fator_lucro_str}")
+
+            # Seção: Taxas e Emolumentos
+            custos_b3_str = f"{format_brl(-metrics.custos_b3):>15}"
+            corretagem_str = f"{format_brl(-metrics.corretagem_total):>15}"
+            custo_op_str = f"{format_brl(-metrics.custo_operacional_total):>15}"
+            irpf_str = f"{format_brl(-metrics.irpf):>15}"
+            res_liq_str = f"{format_brl(metrics.resultado_liquido):>15}"
+            res_liq_colorido = colorize_valor(metrics.resultado_liquido, res_liq_str)
+
+            lbl_corretagem = f"Corretagem (a {format_brl(corretagem_por_ordem)}/ordem):"
+            lbl_b3 = "Custos B3 (Emolumentos + Registro):"
+            lbl_irpf = f"IRPF ({aliquota_irpf:g}%):"
+
+            print("-" * 70)
+            print("TAXAS E EMOLUMENTOS:")
+            print(f"  {lbl_b3:<34} {custos_b3_str}")
+            print(f"  {lbl_corretagem:<34} {corretagem_str}")
+            print(f"  {'Custo Operacional Total:':<34} {custo_op_str}")
+            print(f"  {lbl_irpf:<34} {irpf_str}")
+            print(f"  {'Resultado Líquido:':<34} {res_liq_colorido}")
         else:
             print("INDICADORES: Dados indisponíveis.")
 
@@ -446,6 +496,8 @@ class PerformanceReportCLI:
         self.data_final: date = date.today()
         self.ativo: str = "Todos"
         self.corretagem_por_ordem: float = 0.11
+        self.taxa_b3_por_contrato: float = 0.25
+        self.aliquota_irpf: float = 20.0
 
     def parse_data(self, data_str: str) -> Optional[date]:
         """Converte string no formato DD/MM/AAAA para objeto date."""
@@ -548,8 +600,59 @@ class PerformanceReportCLI:
             except ValueError:
                 print("❌ Valor inválido. Digite um número decimal válido (ex: 0,11).")
 
+    def handle_configurar_taxa_b3(self):
+        """Ação 4: Configurar valor de custos B3 (Emolumentos + Registro) por contrato."""
+        print("\n--- Configuração de Taxas B3 por Contrato ---")
+        atual_str = format_numero(self.taxa_b3_por_contrato)
+        while True:
+            entrada = input(
+                f"Informe a taxa B3 por contrato (ex: 0,25) [{atual_str}]: "
+            ).strip()
+            if not entrada:
+                print(f"Mantido valor de: {format_brl(self.taxa_b3_por_contrato)} / contrato")
+                time.sleep(1)
+                break
+
+            entrada_limpa = entrada.replace("R$", "").replace(" ", "").replace(",", ".")
+            try:
+                valor = float(entrada_limpa)
+                if valor < 0:
+                    print("❌ A taxa B3 não pode ser negativa.")
+                    continue
+                self.taxa_b3_por_contrato = valor
+                print(f"✅ Taxa B3 configurada para: {format_brl(self.taxa_b3_por_contrato)} / contrato")
+                time.sleep(1)
+                break
+            except ValueError:
+                print("❌ Valor inválido. Digite um número decimal válido (ex: 0,25).")
+
+    def handle_configurar_irpf(self):
+        """Ação 5: Configurar alíquota de IRPF sobre operações Day Trade."""
+        print("\n--- Configuração de Alíquota IRPF (%) ---")
+        while True:
+            entrada = input(
+                f"Informe a alíquota de IRPF em % (ex: 20) [{self.aliquota_irpf:g}%]: "
+            ).strip()
+            if not entrada:
+                print(f"Mantida alíquota de: {self.aliquota_irpf:g}%")
+                time.sleep(1)
+                break
+
+            entrada_limpa = entrada.replace("%", "").replace(" ", "").replace(",", ".")
+            try:
+                valor = float(entrada_limpa)
+                if valor < 0 or valor > 100:
+                    print("❌ A alíquota deve ser entre 0% e 100%.")
+                    continue
+                self.aliquota_irpf = valor
+                print(f"✅ Alíquota IRPF configurada para: {self.aliquota_irpf:g}%")
+                time.sleep(1)
+                break
+            except ValueError:
+                print("❌ Valor inválido. Digite um número decimal válido (ex: 20).")
+
     def handle_iniciar_relatorio(self):
-        """Ação 4: Iniciar visualização do relatório com atualização a cada 15 segundos."""
+        """Ação 6: Iniciar visualização do relatório com atualização a cada 15 segundos."""
         print("\nIniciando relatório de performance...")
         try:
             while True:
@@ -559,6 +662,8 @@ class PerformanceReportCLI:
                     self.data_final,
                     self.ativo,
                     self.corretagem_por_ordem,
+                    self.taxa_b3_por_contrato,
+                    self.aliquota_irpf,
                 )
                 ok_pos, positions, err_pos = self.service.get_open_positions(self.ativo)
 
@@ -575,6 +680,9 @@ class PerformanceReportCLI:
                     last_update=now,
                     metrics=metrics if ok_perf else None,
                     positions=positions if ok_pos else [],
+                    corretagem_por_ordem=self.corretagem_por_ordem,
+                    taxa_b3_por_contrato=self.taxa_b3_por_contrato,
+                    aliquota_irpf=self.aliquota_irpf,
                     error_msg=error_msg,
                 )
 
@@ -584,7 +692,7 @@ class PerformanceReportCLI:
                     time.sleep(0.5)
 
         except KeyboardInterrupt:
-            # Ctrl+C volta ao menu principal preservando período, ativo e corretagem
+            # Ctrl+C volta ao menu principal preservando filtros e configurações
             print("\n\nVoltando ao menu principal...")
             time.sleep(0.8)
 
@@ -597,6 +705,8 @@ class PerformanceReportCLI:
                     self.data_final,
                     self.ativo,
                     self.corretagem_por_ordem,
+                    self.taxa_b3_por_contrato,
+                    self.aliquota_irpf,
                 )
                 opcao = input("Escolha uma opção: ").strip()
 
@@ -607,6 +717,10 @@ class PerformanceReportCLI:
                 elif opcao == "3":
                     self.handle_configurar_corretagem()
                 elif opcao == "4":
+                    self.handle_configurar_taxa_b3()
+                elif opcao == "5":
+                    self.handle_configurar_irpf()
+                elif opcao == "6":
                     self.handle_iniciar_relatorio()
                 elif opcao == "0":
                     # Sair
@@ -615,7 +729,7 @@ class PerformanceReportCLI:
                     print("Até logo!")
                     break
                 else:
-                    print("❌ Opção inválida. Escolha 1, 2, 3, 4 ou 0.")
+                    print("❌ Opção inválida. Escolha 1, 2, 3, 4, 5, 6 ou 0.")
                     time.sleep(1)
         except (KeyboardInterrupt, EOFError):
             print("\nEncerrando aplicação...")
