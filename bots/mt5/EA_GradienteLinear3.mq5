@@ -122,6 +122,8 @@ int    handleTPV        = INVALID_HANDLE;
 double preco_entrada     = 0;
 int    niveis_colocados  = 0;
 int    direcao_atual     = 0;  // 0 = sem posição, 1 = comprado, -1 = vendido
+int      g_ultimaDirecaoEncerrada = 0; // direção do último ciclo encerrado (pra reconhecer entrada fantasma logo após o fim)
+datetime g_cicloEncerradoEm       = 0;
 int    g_direcaoCiclo    = 0;  // direção com que o ciclo foi ABERTO (AbrirGrid). Nunca é sobrescrita pela posição real: serve pra detectar inversão de posição
 bool   g_fechandoPorStop = false; // true durante o FecharTudo(), pra OnTradeTransaction não recarregar níveis nesse caso
 bool   g_molaAtiva       = false;
@@ -282,6 +284,15 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       g_totalNiveis++;
 
       bool ehCompra = (tipoDeal == DEAL_TYPE_BUY);
+
+      // Sem ciclo ativo (acabou de encerrar): essa entrada não veio do AbrirGrid. O OnTick decide
+      // se é fantasma (fecha) ou posição órfã (adota). Não monta OCO/balde em cima dela.
+      if(g_direcaoCiclo == 0)
+      {
+         Print("Entrada sem ciclo ativo (", (ehCompra ? "COMPRA" : "VENDA"), " em ", DoubleToString(precoDeal, _Digits),
+               ", vol=", volumeDeal, "). Deixando o OnTick resolver.");
+         return;
+      }
 
       // Entrada na direção contrária à do ciclo = posição invertida por uma ordem de saída
       // dimensionada com posição defasada. Não monta OCO/balde em cima disso.
@@ -798,10 +809,9 @@ void AtualizarBalde()
    double volumeAtualOrdem = -1;
    double precoAtualOrdem  = -1;
 
-   if(g_baldeTicket != 0 && OrderSelect(g_baldeTicket))
+   if(g_baldeTicket != 0)
    {
-      ENUM_ORDER_STATE st = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
-      if(st == ORDER_STATE_PLACED)
+      if(OrderSelect(g_baldeTicket) && (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE) == ORDER_STATE_PLACED)
       {
          ordemAtualValida = true;
          volumeAtualOrdem = OrderGetDouble(ORDER_VOLUME_CURRENT);
@@ -809,6 +819,25 @@ void AtualizarBalde()
       }
       else
       {
+         // O balde saiu do book. Se foi EXECUTADO (total/parcial) ou o histórico ainda não sabe dizer,
+         // a posição lida acima pode estar defasada: criar balde novo agora, dimensionado por ela,
+         // inverte a posição. Só recria se o balde foi comprovadamente cancelado/expirado/rejeitado.
+         bool conhecido = HistoryOrderSelect(g_baldeTicket);
+         if(!conhecido)
+         {
+            Sleep(200);
+            conhecido = HistoryOrderSelect(g_baldeTicket);
+         }
+
+         ENUM_ORDER_STATE stHist = conhecido ? (ENUM_ORDER_STATE)HistoryOrderGetInteger(g_baldeTicket, ORDER_STATE) : ORDER_STATE_STARTED;
+         bool saiuSemExecutar = conhecido && (stHist == ORDER_STATE_CANCELED || stHist == ORDER_STATE_REJECTED || stHist == ORDER_STATE_EXPIRED);
+
+         if(!saiuSemExecutar)
+         {
+            Print("Balde #", g_baldeTicket, " saiu do book (executado ou estado ainda não confirmado). Não cria balde novo; aguarda o deal / próximo tick.");
+            return;
+         }
+
          g_baldeTicket = 0;
       }
    }
@@ -924,6 +953,29 @@ void OnTick()
    {
       long tipoPosReal = PositionGetInteger(POSITION_TYPE);
       int  direcaoReal = (tipoPosReal == POSITION_TYPE_BUY) ? 1 : -1;
+
+      // Posição sem ciclo ativo (g_direcaoCiclo == 0), seja por entrada fantasma logo após o fim de um
+      // ciclo, seja por estado apagado com a posição viva:
+      //  - direção contrária à do ciclo que acabou há pouco = fantasma -> fecha;
+      //  - caso contrário adota a posição real como ciclo, e o GarantirGrid monta o grid.
+      if(g_direcaoCiclo == 0)
+      {
+         bool fantasma = (g_ultimaDirecaoEncerrada != 0 && direcaoReal != g_ultimaDirecaoEncerrada
+                          && TimeCurrent() - g_cicloEncerradoEm <= 60);
+         if(fantasma)
+         {
+            Print("!!! ALERTA: entrada fantasma (", (direcaoReal == 1 ? "comprado" : "vendido"), ", vol=", PositionGetDouble(POSITION_VOLUME),
+                  ") logo após o fim do ciclo ", (g_ultimaDirecaoEncerrada == 1 ? "comprado" : "vendido"), ". Fechando.");
+            FecharTudo("ENTRADA FANTASMA");
+            return;
+         }
+
+         g_direcaoCiclo = direcaoReal;
+         direcao_atual  = direcaoReal;
+         preco_entrada  = PositionGetDouble(POSITION_PRICE_OPEN);
+         Print("!!! ALERTA: posição aberta sem ciclo ativo (", (direcaoReal == 1 ? "comprado" : "vendido"), ", vol=",
+               PositionGetDouble(POSITION_VOLUME), "). Adotada como ciclo (referência=", DoubleToString(preco_entrada, _Digits), "); grid será recolocado.");
+      }
 
       // Fluxo nunca inverte: posição contrária à do ciclo só nasce de ordem de saída dimensionada
       // com posição defasada. Desfaz na hora (fecha a posição invertida, cancela o resto) e volta
@@ -1335,6 +1387,14 @@ bool ExistemOrdensOrfas()
 //+------------------------------------------------------------------+
 void LimparEstadoCiclo()
 {
+   // Guarda a direção do ciclo que acabou: uma posição contrária que apareça logo depois
+   // (ordem de saída executada com posição defasada) é "fantasma" e precisa ser desfeita.
+   if(g_direcaoCiclo != 0)
+   {
+      g_ultimaDirecaoEncerrada = g_direcaoCiclo;
+      g_cicloEncerradoEm       = TimeCurrent();
+   }
+
    g_molaAtiva      = false;
    g_baldeExiste    = false;
    g_baldeVolume    = 0;
