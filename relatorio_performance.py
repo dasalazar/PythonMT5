@@ -255,6 +255,31 @@ class MT5PerformanceService:
         return True, metrics, ""
 
 
+# Habilita suporte a códigos de escape ANSI no console do Windows
+if os.name == "nt":
+    os.system("")
+
+
+class Colors:
+    """Códigos de escape ANSI para coloração no terminal."""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    GREEN = "\033[92m"
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    CYAN = "\033[96m"
+    GRAY = "\033[90m"
+
+
+def colorize_valor(valor: float, texto_formatado: str) -> str:
+    """Aplica coloração verde para positivo e vermelho para negativo."""
+    if valor > 1e-9:
+        return f"{Colors.GREEN}{texto_formatado}{Colors.RESET}"
+    elif valor < -1e-9:
+        return f"{Colors.RED}{texto_formatado}{Colors.RESET}"
+    return texto_formatado
+
+
 class CLIFormatter:
     """Formatador de telas para o terminal."""
 
@@ -313,24 +338,62 @@ class CLIFormatter:
         print("-" * 70)
 
         if error_msg:
-            print("⚠️  ERRO DE CONEXÃO COM O METATRADER 5:")
+            print(f"{Colors.RED}⚠️  ERRO DE CONEXÃO COM O METATRADER 5:{Colors.RESET}")
             print(f"  {error_msg}")
             print("\n  Tentando reconectar automaticamente a cada 15 segundos...")
             print("=" * 70)
             return
 
         if metrics is not None:
-            fator_lucro_str = (
-                format_numero(metrics.fator_lucro) if metrics.fator_lucro is not None else "—"
+            # Formatação com preenchimento antes da aplicação de ANSI para não quebrar alinhamento
+            res_total_str = f"{format_brl(metrics.resultado_total):>15}"
+            lucro_bruto_str = f"{format_brl(metrics.lucro_bruto):>15}"
+            prejuizo_bruto_str = f"{format_brl(metrics.prejuizo_bruto):>15}"
+            qtd_ops_str = f"{metrics.qtd_operacoes:>15}"
+            
+            venc_str = f"{metrics.qtd_vencedoras:>15}"
+            perd_str = f"{metrics.qtd_perdedoras:>15}"
+
+            if metrics.fator_lucro is not None:
+                fator_val_str = f"{format_numero(metrics.fator_lucro):>15}"
+                if metrics.fator_lucro >= 1.0:
+                    fator_lucro_str = f"{Colors.GREEN}{fator_val_str}{Colors.RESET}"
+                else:
+                    fator_lucro_str = f"{Colors.RED}{fator_val_str}{Colors.RESET}"
+            else:
+                fator_lucro_str = f"{'—':>15}"
+
+            # Coloração semântica
+            res_total_colorido = colorize_valor(metrics.resultado_total, res_total_str)
+            lucro_bruto_colorido = (
+                f"{Colors.GREEN}{lucro_bruto_str}{Colors.RESET}"
+                if metrics.lucro_bruto > 0
+                else lucro_bruto_str
             )
+            prejuizo_bruto_colorido = (
+                f"{Colors.RED}{prejuizo_bruto_str}{Colors.RESET}"
+                if metrics.prejuizo_bruto < 0
+                else prejuizo_bruto_str
+            )
+            venc_colorido = (
+                f"{Colors.GREEN}{venc_str}{Colors.RESET}"
+                if metrics.qtd_vencedoras > 0
+                else venc_str
+            )
+            perd_colorido = (
+                f"{Colors.RED}{perd_str}{Colors.RESET}"
+                if metrics.qtd_perdedoras > 0
+                else perd_str
+            )
+
             print("INDICADORES (OPERAÇÕES FECHADAS):")
-            print(f"  Resultado Total:                  {format_brl(metrics.resultado_total):>15}")
-            print(f"  Lucro Bruto:                      {format_brl(metrics.lucro_bruto):>15}")
-            print(f"  Prejuízo Bruto:                  {format_brl(metrics.prejuizo_bruto):>15}")
-            print(f"  Quantidade de Operações:          {metrics.qtd_operacoes:>15}")
-            print(f"  Operações Vencedoras:             {metrics.qtd_vencedoras:>15}")
-            print(f"  Operações Perdedoras:             {metrics.qtd_perdedoras:>15}")
-            print(f"  Fator de Lucro:                   {fator_lucro_str:>15}")
+            print(f"  Resultado Total:                  {res_total_colorido}")
+            print(f"  Lucro Bruto:                      {lucro_bruto_colorido}")
+            print(f"  Prejuízo Bruto:                  {prejuizo_bruto_colorido}")
+            print(f"  Quantidade de Operações:          {qtd_ops_str}")
+            print(f"  Operações Vencedoras:             {venc_colorido}")
+            print(f"  Operações Perdedoras:             {perd_colorido}")
+            print(f"  Fator de Lucro:                   {fator_lucro_str}")
         else:
             print("INDICADORES: Dados indisponíveis.")
 
@@ -343,10 +406,18 @@ class CLIFormatter:
                 qtd_str = format_quantidade(pos.quantidade)
                 preco_str = format_preco(pos.preco_medio)
                 pl_str = format_brl(pos.lucro_prejuizo)
+                pl_colorido = colorize_valor(pos.lucro_prejuizo, pl_str)
+
+                # Coloração do tipo de posição (Compra = Verde, Venda = Vermelho)
+                if pos.tipo == "Compra":
+                    tipo_colorido = f"{Colors.GREEN}{pos.tipo:<6}{Colors.RESET}"
+                else:
+                    tipo_colorido = f"{Colors.RED}{pos.tipo:<6}{Colors.RESET}"
+
                 print(
-                    f"  Ativo: {pos.symbol:<8} | Tipo: {pos.tipo:<6} | "
+                    f"  Ativo: {pos.symbol:<8} | Tipo: {tipo_colorido} | "
                     f"Qtd: {qtd_str:>3} | Preço Médio: {preco_str} | "
-                    f"Lucro/Prejuízo: {pl_str}"
+                    f"Lucro/Prejuízo: {pl_colorido}"
                 )
         print("=" * 70)
 
