@@ -30,6 +30,8 @@ class PerformanceMetrics:
     qtd_vencedoras: int = 0
     qtd_perdedoras: int = 0
     fator_lucro: Optional[float] = None  # None representa "—" (indefinido)
+    qtd_ordens: int = 0
+    corretagem_total: float = 0.0
 
 
 @dataclass
@@ -158,7 +160,11 @@ class MT5PerformanceService:
         return True, result, ""
 
     def calculate_performance(
-        self, data_ini: date, data_fim: date, ativo_filtro: str = "Todos"
+        self,
+        data_ini: date,
+        data_fim: date,
+        ativo_filtro: str = "Todos",
+        corretagem_por_ordem: float = 0.11,
     ) -> Tuple[bool, PerformanceMetrics, str]:
         """
         Calcula os indicadores de performance para operações fechadas no período.
@@ -201,6 +207,7 @@ class MT5PerformanceService:
                 candidate_position_ids.add(deal.position_id)
 
         operacoes_resultados: List[float] = []
+        total_ordens: int = 0
 
         for pos_id in candidate_position_ids:
             # Se ainda estiver aberta, não entra nos indicadores de fechadas (RN-08)
@@ -230,10 +237,13 @@ class MT5PerformanceService:
             # RN-02: Lucro/prejuízo apurado pelas execuções da operação, sem comissão, swap e taxas
             op_profit = sum(float(d.profit) for d in sorted_deals)
             operacoes_resultados.append(op_profit)
+            total_ordens += len(sorted_deals)
 
         # Calcular métricas
         metrics = PerformanceMetrics()
         metrics.qtd_operacoes = len(operacoes_resultados)
+        metrics.qtd_ordens = total_ordens
+        metrics.corretagem_total = total_ordens * corretagem_por_ordem
 
         for res in operacoes_resultados:
             if res > 0:
@@ -295,7 +305,7 @@ class CLIFormatter:
         print("=" * 70)
 
     @staticmethod
-    def render_menu(data_ini: date, data_fim: date, ativo: str):
+    def render_menu(data_ini: date, data_fim: date, ativo: str, corretagem: float):
         CLIFormatter.clear_screen()
         CLIFormatter.render_header("RELATÓRIO DE PERFORMANCE MT5")
         
@@ -306,13 +316,15 @@ class CLIFormatter:
             periodo_str += " (Hoje)"
 
         print("Configuração Atual:")
-        print(f"  • Período: {periodo_str}")
-        print(f"  • Ativo:   {ativo}")
+        print(f"  • Período:    {periodo_str}")
+        print(f"  • Ativo:      {ativo}")
+        print(f"  • Corretagem: {format_brl(corretagem)} / ordem")
         print("-" * 70)
         print("Opções:")
         print("  (1) Período")
         print("  (2) Ativo")
-        print("  (3) Iniciar relatório")
+        print("  (3) Corretagem por ordem")
+        print("  (4) Iniciar relatório")
         print("  (0) Sair")
         print("=" * 70)
 
@@ -386,11 +398,14 @@ class CLIFormatter:
                 else perd_str
             )
 
+            corretagem_str = format_brl(metrics.corretagem_total)
+            detalhe_ordens = f" (Ordens: {metrics.qtd_ordens} | Corretagem: {corretagem_str})"
+
             print("INDICADORES (OPERAÇÕES FECHADAS):")
             print(f"  Resultado Total:                  {res_total_colorido}")
             print(f"  Lucro Bruto:                      {lucro_bruto_colorido}")
             print(f"  Prejuízo Bruto:                  {prejuizo_bruto_colorido}")
-            print(f"  Quantidade de Operações:          {qtd_ops_str}")
+            print(f"  Quantidade de Operações:          {qtd_ops_str}{detalhe_ordens}")
             print(f"  Operações Vencedoras:             {venc_colorido}")
             print(f"  Operações Perdedoras:             {perd_colorido}")
             print(f"  Fator de Lucro:                   {fator_lucro_str}")
@@ -430,6 +445,7 @@ class PerformanceReportCLI:
         self.data_inicial: date = date.today()
         self.data_final: date = date.today()
         self.ativo: str = "Todos"
+        self.corretagem_por_ordem: float = 0.11
 
     def parse_data(self, data_str: str) -> Optional[date]:
         """Converte string no formato DD/MM/AAAA para objeto date."""
@@ -506,14 +522,43 @@ class PerformanceReportCLI:
             else:
                 print(f"❌ Opção inválida. Escolha um número entre 1 e {len(options)}.")
 
+    def handle_configurar_corretagem(self):
+        """Ação 3: Configurar valor da taxa de corretagem por ordem."""
+        print("\n--- Configuração de Corretagem por Ordem ---")
+        atual_str = format_numero(self.corretagem_por_ordem)
+        while True:
+            entrada = input(
+                f"Informe o valor da corretagem por ordem (ex: 0,11) [{atual_str}]: "
+            ).strip()
+            if not entrada:
+                print(f"Mantido valor de: {format_brl(self.corretagem_por_ordem)} / ordem")
+                time.sleep(1)
+                break
+
+            entrada_limpa = entrada.replace("R$", "").replace(" ", "").replace(",", ".")
+            try:
+                valor = float(entrada_limpa)
+                if valor < 0:
+                    print("❌ O valor da corretagem não pode ser negativo.")
+                    continue
+                self.corretagem_por_ordem = valor
+                print(f"✅ Corretagem configurada para: {format_brl(self.corretagem_por_ordem)} / ordem")
+                time.sleep(1)
+                break
+            except ValueError:
+                print("❌ Valor inválido. Digite um número decimal válido (ex: 0,11).")
+
     def handle_iniciar_relatorio(self):
-        """Ação 3: Iniciar visualização do relatório com atualização a cada 15 segundos."""
+        """Ação 4: Iniciar visualização do relatório com atualização a cada 15 segundos."""
         print("\nIniciando relatório de performance...")
         try:
             while True:
                 now = datetime.now()
                 ok_perf, metrics, err_perf = self.service.calculate_performance(
-                    self.data_inicial, self.data_final, self.ativo
+                    self.data_inicial,
+                    self.data_final,
+                    self.ativo,
+                    self.corretagem_por_ordem,
                 )
                 ok_pos, positions, err_pos = self.service.get_open_positions(self.ativo)
 
@@ -539,7 +584,7 @@ class PerformanceReportCLI:
                     time.sleep(0.5)
 
         except KeyboardInterrupt:
-            # Ação 4: Ctrl+C volta ao menu principal preservando período e ativo
+            # Ctrl+C volta ao menu principal preservando período, ativo e corretagem
             print("\n\nVoltando ao menu principal...")
             time.sleep(0.8)
 
@@ -547,7 +592,12 @@ class PerformanceReportCLI:
         """Loop principal da aplicação."""
         try:
             while True:
-                CLIFormatter.render_menu(self.data_inicial, self.data_final, self.ativo)
+                CLIFormatter.render_menu(
+                    self.data_inicial,
+                    self.data_final,
+                    self.ativo,
+                    self.corretagem_por_ordem,
+                )
                 opcao = input("Escolha uma opção: ").strip()
 
                 if opcao == "1":
@@ -555,15 +605,17 @@ class PerformanceReportCLI:
                 elif opcao == "2":
                     self.handle_selecionar_ativo()
                 elif opcao == "3":
+                    self.handle_configurar_corretagem()
+                elif opcao == "4":
                     self.handle_iniciar_relatorio()
                 elif opcao == "0":
-                    # Ação 5: Sair
+                    # Sair
                     print("\nEncerrando aplicação e desconectando do MetaTrader 5...")
                     self.service.shutdown()
                     print("Até logo!")
                     break
                 else:
-                    print("❌ Opção inválida. Escolha 1, 2, 3 ou 0.")
+                    print("❌ Opção inválida. Escolha 1, 2, 3, 4 ou 0.")
                     time.sleep(1)
         except (KeyboardInterrupt, EOFError):
             print("\nEncerrando aplicação...")
