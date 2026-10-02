@@ -9,5 +9,14 @@
   },
   "enabledPlugins": {
     "superpowers@superpowers-marketplace": true
+  },
+  "permissions": {
+    "deny": [
+      "Skill(writing-linkedin-posts)",
+      "Skill(publishing-linkedin-posts)",
+      "Skill(linkedin-comment-drafter)",
+      "Skill(content-calendar)",
+      "Skill(humanizer)"
+    ]
   }
 }

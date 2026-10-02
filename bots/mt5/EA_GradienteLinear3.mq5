@@ -122,6 +122,7 @@ int    handleTPV        = INVALID_HANDLE;
 double preco_entrada     = 0;
 int    niveis_colocados  = 0;
 int    direcao_atual     = 0;  // 0 = sem posição, 1 = comprado, -1 = vendido
+int    g_direcaoCiclo    = 0;  // direção com que o ciclo foi ABERTO (AbrirGrid). Nunca é sobrescrita pela posição real: serve pra detectar inversão de posição
 bool   g_fechandoPorStop = false; // true durante o FecharTudo(), pra OnTradeTransaction não recarregar níveis nesse caso
 bool   g_molaAtiva       = false;
 int    g_totalNiveis     = 0;  // contagem de unidades preenchidas no ciclo atual (inclui a entrada a mercado)
@@ -230,6 +231,7 @@ int OnInit()
    if(PositionSelect(_Symbol))
    {
       direcao_atual    = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
+      g_direcaoCiclo   = direcao_atual;
       preco_entrada    = PositionGetDouble(POSITION_PRICE_OPEN);
       niveis_colocados = NiveisGradiente; // assume que os níveis já tinham sido colocados antes do restart
       Print("EA reiniciado com posição já aberta. Estado reconstruído de forma aproximada — g_totalNiveis, Mola e balde ficam zerados.");
@@ -280,6 +282,16 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       g_totalNiveis++;
 
       bool ehCompra = (tipoDeal == DEAL_TYPE_BUY);
+
+      // Entrada na direção contrária à do ciclo = posição invertida por uma ordem de saída
+      // dimensionada com posição defasada. Não monta OCO/balde em cima disso.
+      if(g_direcaoCiclo != 0 && (ehCompra ? 1 : -1) != g_direcaoCiclo)
+      {
+         Print("!!! ALERTA: entrada em direção contrária à do ciclo (", (ehCompra ? "COMPRA" : "VENDA"),
+               " em ", DoubleToString(precoDeal, _Digits), ", vol=", volumeDeal,
+               "). Posição invertida — EA não mexe em nenhuma ordem. Intervenção manual necessária.");
+         return;
+      }
 
       if(g_molaAtiva)
       {
@@ -666,6 +678,33 @@ void MigrarOrdensAlemDoTeto(ENUM_ORDER_TYPE tipo, double teto, bool ehCompra)
 }
 
 //+------------------------------------------------------------------+
+//| PositionSelect que não confia em posição defasada: se houve deal  |
+//| nosso nos últimos segundos, o terminal pode ainda não ter         |
+//| atualizado a posição. Espera um instante e relê.                  |
+//+------------------------------------------------------------------+
+bool PosicaoAtualizada()
+{
+   bool dealRecente = false;
+
+   if(HistorySelect(TimeCurrent() - 3, TimeCurrent() + 60))
+   {
+      for(int i = HistoryDealsTotal() - 1; i >= 0 && !dealRecente; i--)
+      {
+         ulong deal = HistoryDealGetTicket(i);
+         if(deal == 0) continue;
+         if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) continue;
+         if(HistoryDealGetInteger(deal, DEAL_MAGIC) != MagicNumber) continue;
+         dealRecente = true;
+      }
+   }
+
+   if(dealRecente)
+      Sleep(200);
+
+   return(PositionSelect(_Symbol));
+}
+
+//+------------------------------------------------------------------+
 //| Recria a ordem do balde no preço médio ATUAL da posição ±          |
 //| MolaPontos, com o volume recalculado DO ZERO a cada chamada:      |
 //| volume_balde = volume_da_posição - volume_ainda_coberto_por_OCOs_ |
@@ -675,7 +714,7 @@ void MigrarOrdensAlemDoTeto(ENUM_ORDER_TYPE tipo, double teto, bool ehCompra)
 //+------------------------------------------------------------------+
 void AtualizarBalde()
 {
-   if(!PositionSelect(_Symbol))
+   if(!PosicaoAtualizada())
    {
       if(g_baldeTicket != 0)
       {
@@ -692,6 +731,23 @@ void AtualizarBalde()
    // Garante direção correta baseada diretamente na posição real no terminal
    long tipoPosReal = PositionGetInteger(POSITION_TYPE);
    bool ehCompra    = (tipoPosReal == POSITION_TYPE_BUY);
+
+   // Trava de inversão: se a posição real está na direção contrária à do ciclo, as ordens
+   // pendentes (entradas do grid) têm o mesmo tipo que uma "saída" calculada daqui — mexer
+   // nelas apagaria o grid inteiro e criaria um balde errado. Não toca em nada.
+   if(g_direcaoCiclo != 0 && (ehCompra ? 1 : -1) != g_direcaoCiclo)
+   {
+      static datetime ultimoAlertaInversao = 0;
+      if(TimeCurrent() - ultimoAlertaInversao >= 10)
+      {
+         ultimoAlertaInversao = TimeCurrent();
+         Print("!!! ALERTA: posição real (", (ehCompra ? "comprado" : "vendido"), ", vol=", PositionGetDouble(POSITION_VOLUME),
+               ") inverteu em relação ao ciclo (", (g_direcaoCiclo == 1 ? "compra" : "venda"),
+               "). Balde e grid NÃO serão alterados. Intervenção manual necessária.");
+      }
+      return;
+   }
+
    direcao_atual    = ehCompra ? 1 : -1;
 
    ENUM_ORDER_TYPE tipoSaida = ehCompra ? ORDER_TYPE_SELL_LIMIT : ORDER_TYPE_BUY_LIMIT;
@@ -786,7 +842,15 @@ void AtualizarBalde()
    // JAMAIS ter duas ordens de saída ativas no book que somadas excedam a posição!
    if(ordemAtualValida && g_baldeTicket != 0)
    {
-      trade.OrderDelete(g_baldeTicket);
+      if(!trade.OrderDelete(g_baldeTicket))
+      {
+         // Cancelamento falhou (tipicamente a ordem acabou de executar e a posição lida acima
+         // está defasada). Criar um balde novo agora, dimensionado por posição velha, inverte
+         // a posição. Não cria nada: o próximo tick/deal relê a posição real.
+         Print("Balde: falha ao cancelar o balde atual #", g_baldeTicket, " (", trade.ResultRetcodeDescription(),
+               "). Não cria balde novo agora; reavalia no próximo evento.");
+         return;
+      }
       g_baldeTicket = 0;
    }
 
@@ -860,6 +924,17 @@ void OnTick()
    {
       long tipoPosReal = PositionGetInteger(POSITION_TYPE);
       int  direcaoReal = (tipoPosReal == POSITION_TYPE_BUY) ? 1 : -1;
+
+      // Fluxo nunca inverte: posição contrária à do ciclo só nasce de ordem de saída dimensionada
+      // com posição defasada. Desfaz na hora (fecha a posição invertida, cancela o resto) e volta
+      // a esperar o sinal de entrada normal.
+      if(g_direcaoCiclo != 0 && direcaoReal != g_direcaoCiclo)
+      {
+         Print("!!! ALERTA: posição invertida (", (direcaoReal == 1 ? "comprado" : "vendido"), ", vol=", PositionGetDouble(POSITION_VOLUME),
+               ") em relação ao ciclo (", (g_direcaoCiclo == 1 ? "compra" : "venda"), "). Fechando a posição invertida.");
+         FecharTudo("POSICAO INVERTIDA");
+         return;
+      }
 
       if(direcao_atual != direcaoReal)
       {
@@ -1010,6 +1085,9 @@ void OnTick()
 
    // Mantém auditoria contínua de cobertura e migração de teto para 100% da posição aberta
    AtualizarBalde();
+
+   // Posicionado sempre tem grid: recoloca se sumiu.
+   GarantirGrid();
 }
 
 //+------------------------------------------------------------------+
@@ -1047,6 +1125,7 @@ void AbrirGrid(ENUM_ORDER_TYPE tipo)
 
    preco_entrada    = trade.ResultPrice();
    direcao_atual    = (tipo == ORDER_TYPE_BUY) ? 1 : -1;
+   g_direcaoCiclo   = direcao_atual;
    niveis_colocados = 0;
 
    for(int nivel = 1; nivel <= NiveisGradiente; nivel++)
@@ -1080,16 +1159,129 @@ void AbrirGrid(ENUM_ORDER_TYPE tipo)
 //| Fecha a posição inteira de uma vez e cancela as ordens pendentes  |
 //| restantes do grid (equivalente ao ClosePosition do NTSL).         |
 //+------------------------------------------------------------------+
-void FecharTudo()
+void FecharTudo(string motivo = "STOP FINANCEIRO")
 {
    g_fechandoPorStop = true;
-   trade.PositionClose(_Symbol);
+   bool fechou = trade.PositionClose(_Symbol);
    CancelarOrdensPendentes();
    g_fechandoPorStop = false;
 
-   Print("Posição fechada por STOP FINANCEIRO.");
+   if(!fechou && PositionSelect(_Symbol))
+   {
+      // Posição segue aberta: mantém o estado do ciclo e deixa o próximo tick tentar de novo.
+      Print("!!! ALERTA: falha ao fechar posição (", motivo, "): ", trade.ResultRetcodeDescription(), ". Tenta de novo no próximo tick.");
+      return;
+   }
+
+   Print("Posição fechada por ", motivo, ".");
 
    LimparEstadoCiclo();
+}
+
+//+------------------------------------------------------------------+
+//| Garante "posicionado = grid visível": se há posição e nenhuma     |
+//| pendente de entrada no book (e os níveis não se esgotaram), recoloca|
+//| as entradas dos níveis que ainda não foram preenchidos no ciclo,   |
+//| no mesmo espaçamento a partir de preco_entrada. Só age depois da   |
+//| falta persistir por 2s, pra não brigar com cancela/recoloca da    |
+//| Mola ou com a recarga de nível, que são instantâneas.              |
+//+------------------------------------------------------------------+
+void GarantirGrid()
+{
+   static datetime faltandoDesde  = 0;
+   static datetime ultimaTentativa = 0;
+
+   if(g_direcaoCiclo == 0 || preco_entrada <= 0 || !PositionSelect(_Symbol))
+   {
+      faltandoDesde = 0;
+      return;
+   }
+
+   bool ehCompra = (g_direcaoCiclo == 1);
+   ENUM_ORDER_TYPE tipoEntrada = ehCompra ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
+
+   int pendentesEntrada = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+      if((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) != tipoEntrada) continue;
+      if((ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE) != ORDER_STATE_PLACED) continue;
+      pendentesEntrada++;
+   }
+
+   if(pendentesEntrada > 0 || g_totalNiveis > NiveisGradiente)
+   {
+      faltandoDesde = 0;
+      return;
+   }
+
+   if(faltandoDesde == 0)
+   {
+      faltandoDesde = TimeCurrent();
+      return;
+   }
+   if(TimeCurrent() - faltandoDesde < 2 || TimeCurrent() - ultimaTentativa < 5)
+      return;
+
+   ultimaTentativa = TimeCurrent();
+
+   if(!PosicaoAtualizada())
+   {
+      faltandoDesde = 0;
+      return;
+   }
+
+   // Níveis já preenchidos neste ciclo (deals de entrada desde a abertura da posição):
+   // seguem segurados por OCO/balde, não podem ser recolocados.
+   bool preenchido[];
+   ArrayResize(preenchido, NiveisGradiente + 1);
+   ArrayInitialize(preenchido, false);
+
+   datetime abertura = (datetime)PositionGetInteger(POSITION_TIME);
+   if(HistorySelect(abertura - 1, TimeCurrent() + 60))
+   {
+      for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+      {
+         ulong deal = HistoryDealGetTicket(i);
+         if(deal == 0) continue;
+         if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) continue;
+         if(HistoryDealGetInteger(deal, DEAL_MAGIC) != MagicNumber) continue;
+         if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
+
+         int nivelDeal = (DistanciaGrid > 0) ? (int)MathRound(MathAbs(HistoryDealGetDouble(deal, DEAL_PRICE) - preco_entrada) / DistanciaGrid) : 0;
+         if(nivelDeal >= 1 && nivelDeal <= NiveisGradiente)
+            preenchido[nivelDeal] = true;
+      }
+   }
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   int colocados = 0;
+
+   for(int nivel = 1; nivel <= NiveisGradiente; nivel++)
+   {
+      if(preenchido[nivel]) continue;
+
+      double precoNivel = NormalizarPreco(ehCompra ? (preco_entrada - nivel * DistanciaGrid) : (preco_entrada + nivel * DistanciaGrid));
+
+      // Limit só é válida do lado certo do mercado.
+      if(ehCompra ? (precoNivel >= ask) : (precoNivel <= bid)) continue;
+
+      double vol = g_molaAtiva ? ObterTotalLotePorNivel(nivel) : QuantidadePorOrdem;
+      bool ok = ehCompra ? trade.BuyLimit(vol, precoNivel, _Symbol) : trade.SellLimit(vol, precoNivel, _Symbol);
+      if(ok)
+         colocados++;
+      else
+         Print("Grid: falha ao recolocar nível ", nivel, " em ", DoubleToString(precoNivel, _Digits), ": ", trade.ResultRetcodeDescription());
+   }
+
+   niveis_colocados = colocados;
+   Print("!!! GRID AUSENTE com posição aberta (", (ehCompra ? "compra" : "venda"), ", vol=", PositionGetDouble(POSITION_VOLUME),
+         "). Grid recolocado: ", colocados, " níveis.");
+   faltandoDesde = 0;
 }
 
 void CancelarOrdensPendentes(ulong ticketExcluir = 0)
@@ -1149,6 +1341,7 @@ void LimparEstadoCiclo()
    g_baldeTicket    = 0;
    g_niveisDescarregados = 0;
    direcao_atual    = 0;
+   g_direcaoCiclo   = 0;
    niveis_colocados = 0;
    preco_entrada    = 0;
    g_totalNiveis    = 0;
